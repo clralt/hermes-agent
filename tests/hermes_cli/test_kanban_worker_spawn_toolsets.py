@@ -62,6 +62,7 @@ agent:
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_set_worker_pid", lambda *args, **kwargs: None)
 
     captured = {}
 
@@ -105,6 +106,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     from hermes_cli._parser import build_top_level_parser
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_set_worker_pid", lambda *args, **kwargs: None)
     captured = {}
 
     class FakeProc:
@@ -126,8 +128,11 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
     # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    # Every worker is wrapped in the controller-owned start gate. Parse the
+    # nested Hermes argv after that wrapper rather than assuming Hermes is argv[0].
+    hermes_index = captured["cmd"].index("hermes")
+    assert captured["cmd"][hermes_index + 1:hermes_index + 3] == ["-p", "elias"]
+    args = parser.parse_args(captured["cmd"][hermes_index + 3:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.nousresearch.com/schemas/independent-audit-verdict-v2.json",
+  "title": "Hermes independently signed audit verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "verdict_id", "task_id", "authority_task_id",
+    "audit_task_id", "audit_checkpoint_sha256", "candidate_tree",
+    "contract_sha256", "evidence_manifest_sha256", "dossier_sha256",
+    "status", "producer_identity", "reviewer", "created_at", "expires_at",
+    "signer_key_id", "signature"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "verdict_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "task_id": {"type": "string", "minLength": 1},
+    "authority_task_id": {"type": "string", "minLength": 1},
+    "audit_task_id": {"type": "string", "minLength": 1},
+    "audit_checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "candidate_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evidence_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "dossier_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status": {"enum": ["CLEAN", "FAIL"]},
+    "producer_identity": {"type": "string", "minLength": 1},
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "model", "reasoning_effort"],
+      "properties": {
+        "identity": {"const": "codex-high-independent-auditor"},
+        "model": {"const": "gpt-5.6-sol"},
+        "reasoning_effort": {"const": "high"}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "signer_key_id": {"type": "string", "minLength": 1},
+    "signature": {"type": "string", "minLength": 80, "maxLength": 100}
+  },
+  "signature_contract": {
+    "algorithm": "Ed25519",
+    "payload": "RFC 8785-style canonical JSON used by hermes_cli.audit_verdict.canonical_json_bytes with only the signature member omitted",
+    "trust_root": "operator-pinned trust-store file plus exact SHA-256 configured outside candidate control",
+    "private_key_location": "independent desktop only; never this host"
+  }
+}

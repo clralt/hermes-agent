@@ -1,0 +1,188 @@
+{
+  "schema_version": 2,
+  "task_id": "HERMES-RESUMABLE-EXECUTION",
+  "revision": 6,
+  "base_commit": "aaf0fbfa95180a2ce23b1a2e2d5b0bff26f7edba",
+  "base_tree": "129fc4679c27c085479e699cf72d25c38c6968a6",
+  "candidate_path_count": 24,
+  "self_inventory": {
+    "path": ".governance/HERMES-RESUMABLE-EXECUTION/EVIDENCE_MANIFEST.json",
+    "sha256": null,
+    "reason": "self-hash is externally bound by candidate tree and dossier to avoid recursion"
+  },
+  "files": [
+    {
+      "path": ".governance/HERMES-RESUMABLE-EXECUTION/CONTRACT.json",
+      "sha256": "e0cd0c054fcbb461c06a013aea8567da110557882512c932bfeef6d1b2a852c2",
+      "bytes": 4650,
+      "mode": "0o644"
+    },
+    {
+      "path": ".governance/HERMES-RESUMABLE-EXECUTION/SIGNED_VERDICT_SCHEMA.json",
+      "sha256": "f62c9dd58593ccef993050f42baa6e8310df8d43c0d09458876864b6a447a108",
+      "bytes": 2339,
+      "mode": "0o644"
+    },
+    {
+      "path": ".governance/HERMES-RESUMABLE-EXECUTION/TEST_EVIDENCE.json",
+      "sha256": "0fc7f717b9dd296582635de332040924c1074dfb7e303505b799d8fb92b3d585",
+      "bytes": 905652,
+      "mode": "0o644"
+    },
+    {
+      "path": "agent/turn_finalizer.py",
+      "sha256": "9104bd6835c2fac1ae855cbe1a1c896d70e8484dad6c64b33c87eaca1647b5df",
+      "bytes": 45560,
+      "mode": "0o644"
+    },
+    {
+      "path": "hermes_cli/audit_verdict.py",
+      "sha256": "0ed91d5814b2f5b94249ddc0580103eed896738ce8f3beeabcb23cff2378ee1b",
+      "bytes": 7416,
+      "mode": "0o644"
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "sha256": "34a44feb6a69528cfa1a6347bdc410dbd69730c58bee449ec144a7d297e728c3",
+      "bytes": 497997,
+      "mode": "0o644"
+    },
+    {
+      "path": "hermes_cli/resumable_execution.py",
+      "sha256": "0a4ae2c0cef19393e7ee4272cfc575dd3d135f3092f718e8e8784b2da1533453",
+      "bytes": 39142,
+      "mode": "0o644"
+    },
+    {
+      "path": "model_tools.py",
+      "sha256": "82885cb8d544919dc324ec3dce7c5fc05aac6bdf259db981a850877c53d8c0ea",
+      "bytes": 77217,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/agent/test_turn_finalizer_iteration_limit_exit.py",
+      "sha256": "aa2caf3a468dc6789dc6db3a8fbb6fe6b33b20318648b7dff83e580ccfcb9744",
+      "bytes": 11092,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_audit_verdict.py",
+      "sha256": "eaadeac1d613b76b2763825bbddf6dd973a3a1ce79618785e873ad9f7c373815",
+      "bytes": 5514,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_boards.py",
+      "sha256": "c1b767e0e437a85c79693e278e0b3335892d5f0ebaeb14e02a2cfa701dcf3e89",
+      "bytes": 13178,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_core_functionality.py",
+      "sha256": "40c7673de74efd99b833881f10c587e528dc0573de7d02f18bbedfe3bc687192",
+      "bytes": 50801,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_db.py",
+      "sha256": "b5a57b4ba0b9c30fc1e01d82d4bf85444cec3781f525f1d5c18ae837d2ff2d2c",
+      "bytes": 62407,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_resumable_execution.py",
+      "sha256": "e750340c733f92970732afce4d44b5fc5eec0e370d00408ccb8931121c4663b9",
+      "bytes": 59792,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worker_session_source.py",
+      "sha256": "d47cff333564c4a89a2e5d596cbdc8a1deec9a4c6313b529a3c0d2b0387af9c2",
+      "bytes": 4645,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worker_spawn_toolsets.py",
+      "sha256": "a5d29882753f6f2dcd584c7539d02b27a6cdf9662cd9c4c03b1c3c7baaa0516f",
+      "bytes": 5589,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worker_terminal_cwd.py",
+      "sha256": "8e165c3c232fd8746f8e135ca188e4dce308b2a39a253c8974bd6ec2dd6cf62d",
+      "bytes": 2775,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/run_agent/test_run_agent.py",
+      "sha256": "9bda8e83d4a005b4762308e1f89f6d263ede977672331df356bf10022047e960",
+      "bytes": 257440,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/test_model_tools.py",
+      "sha256": "8cf4d0c24e527bac0865717327b8994d701430e436bbc7d01ced1dc70aaaf3c7",
+      "bytes": 27110,
+      "mode": "0o644"
+    },
+    {
+      "path": "tests/tools/test_kanban_tools.py",
+      "sha256": "cd475dbbb75b6e92cac33329f7fad71400f6ce0008e647dcd0b6ab3e41efcb94",
+      "bytes": 38650,
+      "mode": "0o644"
+    },
+    {
+      "path": "tools/kanban_tools.py",
+      "sha256": "54e4247b9cee42a4849b867ab44eec0d6399a4265426e14de49f69c07294f956",
+      "bytes": 95789,
+      "mode": "0o644"
+    },
+    {
+      "path": "website/docs/reference/tools-reference.md",
+      "sha256": "b94b16417ebfe1793238341143cc764370c0644143adc78f3a966018d690139a",
+      "bytes": 27551,
+      "mode": "0o644"
+    },
+    {
+      "path": "website/docs/user-guide/features/resumable-execution.md",
+      "sha256": "059e133af7fdb074c4d22a8048a99f4fe79860fc29e74c908d3e1fa14237af57",
+      "bytes": 6430,
+      "mode": "0o644"
+    }
+  ],
+  "finding_traceability": {
+    "B-001": [
+      "hermes_cli/kanban_db.py",
+      "tests/hermes_cli/test_kanban_resumable_execution.py"
+    ],
+    "B-002": [
+      "hermes_cli/audit_verdict.py",
+      "hermes_cli/kanban_db.py",
+      "tests/hermes_cli/test_audit_verdict.py",
+      "tests/hermes_cli/test_kanban_resumable_execution.py"
+    ],
+    "B-003": [
+      ".governance/HERMES-RESUMABLE-EXECUTION/TEST_EVIDENCE.json",
+      "tests/hermes_cli/test_kanban_boards.py",
+      "tests/hermes_cli/test_kanban_core_functionality.py",
+      "tests/hermes_cli/test_kanban_worker_session_source.py",
+      "tests/hermes_cli/test_kanban_worker_terminal_cwd.py"
+    ],
+    "B-004": [
+      "hermes_cli/kanban_db.py",
+      "tests/hermes_cli/test_kanban_db.py",
+      "tests/hermes_cli/test_kanban_resumable_execution.py"
+    ],
+    "B-005": [
+      "hermes_cli/resumable_execution.py",
+      "tests/hermes_cli/test_kanban_resumable_execution.py"
+    ]
+  },
+  "verification_summary": {
+    "focused": "12 files, 441 passed, 0 failed",
+    "static": "compile, Ruff, and git diff --check passed",
+    "full_suite": "29200 passed, 80 failed; all failures characterized as pre-existing or environmental at base HEAD",
+    "resource_guard": "high-token defect not proven fixed; continuation externally stopped at 20 API calls before summary path"
+  },
+  "generated_at": "2026-08-11T17:42:47.794206Z"
+}

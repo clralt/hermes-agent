@@ -248,6 +248,7 @@ class TestWorkerSpawnEnv:
 
         class FakeProc:
             pid = 12345
+            def terminate(self): pass
 
         def fake_popen(cmd, *args, **kwargs):
             captured["cmd"] = cmd
@@ -255,6 +256,7 @@ class TestWorkerSpawnEnv:
             return FakeProc()
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(kb, "_set_worker_pid", lambda *a, **kw: None)
         kb.create_board("spawntest")
 
         task = kb.Task(

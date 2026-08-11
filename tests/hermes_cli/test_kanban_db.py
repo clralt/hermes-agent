@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -145,17 +146,92 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        governance = migrated.execute(
+            "SELECT requires_independent_audit FROM tasks WHERE id='legacy'"
+        ).fetchone()
+        assert governance["requires_independent_audit"] is None
+        with pytest.raises(ValueError, match="governance classification is UNKNOWN"):
+            kb.complete_task(migrated, "legacy")
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "work_item_kind" in task_columns
+    assert "continuation_count" in task_columns
+    assert "latest_checkpoint_id" in task_columns
+    assert "terminal_state" in task_columns
+    assert "requires_independent_audit" in task_columns
+
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+
+
+def test_concurrent_idempotent_creators_converge_on_one_task(tmp_path):
+    db_path = tmp_path / "concurrent-idempotency.db"
+    kb.init_db(db_path)
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def create_from_separate_connection():
+        try:
+            with kb.connect_closing(db_path) as conn:
+                barrier.wait(timeout=5)
+                results.append(
+                    kb.create_task(
+                        conn,
+                        title="one canonical successor",
+                        idempotency_key="successor:source-run-7",
+                    )
+                )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=create_from_separate_connection)
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert len(results) == 2
+    assert len(set(results)) == 1
+    with kb.connect_closing(db_path) as conn:
+        row = conn.execute(
+            "SELECT count(*) AS n, min(id) AS canonical_id "
+            "FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+            ("successor:source-run-7",),
+        ).fetchone()
+    assert row["n"] == 1
+    assert row["canonical_id"] == results[0]
+
+
+def test_idempotency_unique_migration_fails_closed_on_conflicting_legacy_rows(
+    tmp_path,
+):
+    db_path = tmp_path / "duplicate-idempotency.db"
+    kb.init_db(db_path)
+    with kb.connect_closing(db_path) as conn:
+        first = kb.create_task(conn, title="first")
+        second = kb.create_task(conn, title="second")
+        conn.execute("DROP INDEX idx_tasks_idempotency")
+        conn.execute(
+            "UPDATE tasks SET idempotency_key='legacy-conflict' WHERE id IN (?, ?)",
+            (first, second),
+        )
+        conn.commit()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(RuntimeError, match="conflicting active idempotency rows"):
+        kb.connect(db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +892,10 @@ class TestSharedBoardPaths:
                 self.pid = 4242
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        # This test exercises argv/environment routing with a synthetic Task,
+        # not dispatcher claim persistence. The launch-CAS behavior has a
+        # dedicated real-board regression in test_kanban_resumable_execution.
+        monkeypatch.setattr(kb, "_set_worker_pid", lambda *args, **kwargs: None)
 
         task = kb.Task(
             id="t_dispatch_env",
@@ -1119,6 +1199,35 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     # Running migration on an already-migrated schema must not raise.
     kb._migrate_add_optional_columns(conn)
     conn.close()
+
+
+def test_failed_audit_default_migration_reclassifies_false_as_unknown():
+    """Rows laundered by the failed NOT NULL DEFAULT 0 schema fail closed."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, "
+        "requires_independent_audit INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.executemany(
+        "INSERT INTO tasks (id, requires_independent_audit) VALUES (?, ?)",
+        [("legacy-false", 0), ("known-required", 1)],
+    )
+    kb._migrate_independent_audit_classification(conn)
+    rows = {
+        row["id"]: row["requires_independent_audit"]
+        for row in conn.execute(
+            "SELECT id, requires_independent_audit FROM tasks ORDER BY id"
+        )
+    }
+    assert rows == {"known-required": 1, "legacy-false": None}
+    info = {
+        row["name"]: row for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    assert info["requires_independent_audit"]["notnull"] == 0
+    assert "requires_independent_audit_legacy" in info
 
 
 # ---------------------------------------------------------------------------

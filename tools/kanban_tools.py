@@ -643,6 +643,32 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    checkpoint_json = args.get("checkpoint_json")
+    if checkpoint_json is not None:
+        if os.environ.get("HERMES_EXECUTION_ROLE", "").strip().lower() != "closer":
+            return tool_error("checkpoint_json terminal completion is reserved for a governed closer")
+        run_id = _worker_run_id(tid)
+        if run_id is None:
+            return tool_error("governed closer completion requires a dispatcher-owned active run")
+        try:
+            checkpoint = json.loads(str(checkpoint_json))
+        except (TypeError, ValueError) as exc:
+            return tool_error(f"checkpoint_json must be valid JSON: {exc}")
+        if not isinstance(checkpoint, dict):
+            return tool_error("checkpoint_json must decode to an object")
+        try:
+            kb, conn = _connect(board=args.get("board"))
+            try:
+                terminal = kb.apply_terminal_checkpoint(
+                    conn, tid, checkpoint=checkpoint, expected_run_id=run_id,
+                    result=args.get("summary") or args.get("result"),
+                )
+                return _ok(task_id=tid, run_id=run_id, terminal_state=terminal)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.exception("kanban_complete governed terminal transition failed")
+            return tool_error(f"kanban_complete: {exc}")
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -942,6 +968,45 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
         return tool_error(f"kanban_heartbeat: {e}")
+
+
+def _handle_phase_checkpoint(args: dict, **kw) -> str:
+    """Persist exact machine state for a possible bounded-run continuation."""
+    delegated_err = _reject_delegated_child_mutation("kanban_phase_checkpoint")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return tool_error("kanban_phase_checkpoint requires a dispatcher-owned active run")
+    raw = args.get("checkpoint_json")
+    if not raw:
+        return tool_error("checkpoint_json is required")
+    try:
+        payload = json.loads(str(raw))
+    except (TypeError, ValueError) as exc:
+        return tool_error(f"checkpoint_json must be valid JSON: {exc}")
+    if not isinstance(payload, dict):
+        return tool_error("checkpoint_json must decode to an object")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            digest = kb.save_phase_checkpoint(
+                conn, tid, checkpoint=payload, expected_run_id=run_id,
+            )
+            return _ok(task_id=tid, run_id=run_id, checkpoint_sha256=digest)
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return tool_error(f"kanban_phase_checkpoint: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_phase_checkpoint failed")
+        return tool_error(f"kanban_phase_checkpoint: {exc}")
 
 
 def _handle_comment(args: dict, **kw) -> str:
@@ -1277,6 +1342,12 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    requires_audit, audit_bool_error = _parse_bool_arg(
+        args, "requires_independent_audit",
+    )
+    if audit_bool_error:
+        return tool_error(audit_bool_error)
+    work_item_kind = args.get("work_item_kind") or "fresh"
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -1328,6 +1399,8 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                work_item_kind=str(work_item_kind),
+                requires_independent_audit=requires_audit,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1678,6 +1751,14 @@ KANBAN_COMPLETE_SCHEMA = {
                     "callers that still set --result on the CLI."
                 ),
             },
+            "checkpoint_json": {
+                "type": "string",
+                "description": (
+                    "Governed closer only: the exact terminal checkpoint JSON. "
+                    "The kernel re-verifies signed audit authority and exact-tree "
+                    "bindings before applying the terminal transition."
+                ),
+            },
             "created_cards": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1790,6 +1871,33 @@ KANBAN_HEARTBEAT_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_PHASE_CHECKPOINT_SCHEMA = {
+    "name": "kanban_phase_checkpoint",
+    "description": (
+        "Persist the exact machine-readable phase state for automatic clean-run "
+        "continuation. Call after material phase progress and before long operations. "
+        "This is routine internal state, not completion, approval, or a manual gate."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "checkpoint_json": {
+                "type": "string",
+                "description": (
+                    "JSON object containing the full resumable checkpoint contract: "
+                    "task/version/objective/scope, role and worker model/effort, phase, "
+                    "Git and exact candidate/evidence bindings, completed/remaining "
+                    "steps, artifacts, validation, audit provenance/findings, external "
+                    "actions, continuation instruction, retries, timestamps, provenance."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["checkpoint_json"],
     },
 }
 
@@ -1974,6 +2082,18 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Dispatcher tiebreaker. Higher = picked sooner "
                     "when multiple ready tasks share an assignee."
+                ),
+            },
+            "work_item_kind": {
+                "type": "string",
+                "enum": ["fresh", "remediation", "audit"],
+                "description": "Queue class for fresh, remediation, or independent-audit work.",
+            },
+            "requires_independent_audit": {
+                "type": "boolean",
+                "description": (
+                    "Fail closed against ordinary kanban_complete; only a trusted "
+                    "CLEAN audit checkpoint plus authorized exact-tree closer may close."
                 ),
             },
             "workspace_kind": {
@@ -2184,6 +2304,15 @@ registry.register(
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
     emoji="💓",
+)
+
+registry.register(
+    name="kanban_phase_checkpoint",
+    toolset="kanban",
+    schema=KANBAN_PHASE_CHECKPOINT_SCHEMA,
+    handler=_handle_phase_checkpoint,
+    check_fn=_check_kanban_mode,
+    emoji="💾",
 )
 
 registry.register(

@@ -40,6 +40,89 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+# An independent auditor is a confined observer. It receives repository reads
+# and two narrow dispatcher-owned liveness/checkpoint channels, never a generic
+# shell, file mutation, network, completion, or database-management capability.
+_READ_ONLY_AUDITOR_TOOLS = frozenset({
+    "read_file", "search_files", "kanban_phase_checkpoint", "kanban_heartbeat",
+})
+_GOVERNED_CLOSER_TOOLS = frozenset({
+    "read_file", "search_files", "kanban_heartbeat",
+    "kanban_phase_checkpoint",
+})
+
+
+def _is_read_only_auditor() -> bool:
+    return os.environ.get("HERMES_EXECUTION_ROLE", "").strip().lower() == "auditor"
+
+
+def _is_governed_closer() -> bool:
+    return os.environ.get("HERMES_EXECUTION_ROLE", "").strip().lower() == "closer"
+
+
+def _execution_role_is_locked() -> bool:
+    """True in confined observer processes (auditor / closer).
+
+    A locked role must never execute extension Python: no plugin discovery,
+    no pre/post tool hooks, no request/execution middleware, no result
+    transforms. Plugin and hook code runs with the full capabilities of the
+    process and would sidestep the tool whitelist entirely.
+    """
+    return _is_read_only_auditor() or _is_governed_closer()
+
+
+def _authorize_role_dispatch(function_name: str, function_args: Any) -> Optional[str]:
+    """Authorize the FINAL dispatched (name, arguments) pair for a locked role.
+
+    Returns a tool_error string when denied, ``None`` when authorized. This
+    must be evaluated immediately before ``registry.dispatch`` on the exact
+    arguments being dispatched — after coercion and after any middleware
+    rewrite — not only at call intake. Checking intake arguments alone allows
+    a request-middleware rewrite to move an initially confined read outside
+    ``HERMES_AUDIT_WORKSPACE`` (revision-4 finding B-001).
+    """
+    if _is_read_only_auditor():
+        if function_name not in _READ_ONLY_AUDITOR_TOOLS:
+            return tool_error(
+                f"'{function_name}' is unavailable to a read-only auditor; "
+                "auditor processes cannot mutate files/state, run commands, "
+                "use network tools, or close tasks"
+            )
+        if not _auditor_read_is_confined(function_name, function_args):
+            return tool_error(
+                f"'{function_name}' path is outside immutable audit workspace"
+            )
+        return None
+    if _is_governed_closer():
+        if function_name not in _GOVERNED_CLOSER_TOOLS:
+            return tool_error(
+                f"'{function_name}' is unavailable to a governed closer; signed "
+                "authority is applied only by the external controller, never by "
+                "model code"
+            )
+        return None
+    return None
+
+
+def _auditor_read_is_confined(function_name: str, function_args: Any) -> bool:
+    if function_name not in {"read_file", "search_files"}:
+        return True
+    root_raw = os.environ.get("HERMES_AUDIT_WORKSPACE", "").strip()
+    if not root_raw or not isinstance(function_args, dict):
+        return False
+    from pathlib import Path
+
+    root = Path(root_raw).resolve()
+    raw_path = function_args.get("path") or "."
+    target = Path(str(raw_path)).expanduser()
+    if not target.is_absolute():
+        target = root / target
+    try:
+        target.resolve(strict=False).relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return True
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -226,10 +309,19 @@ discover_builtin_tools()
 #   - tui_gateway/server.py     -> inline on startup (no event loop)
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
-# Plugin tool discovery (user/project/pip plugins)
+# Plugin tool discovery (user/project/pip plugins).
+# NEVER in a confined auditor/closer process: discover_plugins imports and
+# executes arbitrary plugin Python with the full capabilities of this process,
+# outside the role tool whitelist (revision-4 finding B-002).
 try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
+    if _execution_role_is_locked():
+        logger.info(
+            "plugin discovery disabled: confined execution role %r",
+            os.environ.get("HERMES_EXECUTION_ROLE", ""),
+        )
+    else:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
 except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
 
@@ -351,6 +443,7 @@ def get_tool_definitions(
                 registry._generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
+                os.environ.get("HERMES_EXECUTION_ROLE", "").strip().lower(),
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
@@ -482,6 +575,16 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    if _is_read_only_auditor():
+        filtered_tools = [
+            item for item in filtered_tools
+            if item.get("function", {}).get("name") in _READ_ONLY_AUDITOR_TOOLS
+        ]
+    elif _is_governed_closer():
+        filtered_tools = [
+            item for item in filtered_tools
+            if item.get("function", {}).get("name") in _GOVERNED_CLOSER_TOOLS
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1094,7 +1197,12 @@ def _emit_post_tool_call_hook(
     ``status`` is not supplied, the ok/error fields are derived from the
     result *after* the gate (parsing the result is only worth it when a
     listener will actually consume it).
+
+    Confined auditor/closer processes never fire this hook: hook callbacks
+    are plugin Python running outside the role tool whitelist (B-002).
     """
+    if _execution_role_is_locked():
+        return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
@@ -1165,11 +1273,33 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    if _is_read_only_auditor() and function_name not in _READ_ONLY_AUDITOR_TOOLS:
+        return tool_error(
+            f"'{function_name}' is unavailable to a read-only auditor; "
+            "auditor processes cannot mutate files/state, run commands, use network "
+            "tools, or close tasks"
+        )
+    if _is_read_only_auditor() and not _auditor_read_is_confined(
+        function_name, function_args,
+    ):
+        return tool_error(
+            f"'{function_name}' path is outside immutable audit workspace"
+        )
+    if _is_governed_closer() and function_name not in _GOVERNED_CLOSER_TOOLS:
+        return tool_error(
+            f"'{function_name}' is unavailable to a governed closer; signed authority "
+            "is applied only by the external controller, never by model code"
+        )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+    # Confined roles execute no extension Python at all: middleware, plugin
+    # pre/post hooks, and result transforms are disabled for the whole call
+    # (B-002), and the final dispatch re-authorizes name+args (B-001).
+    _role_locked = _execution_role_is_locked()
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -1282,7 +1412,7 @@ def handle_function_call(
             )
 
     _tool_original_args = dict(function_args)
-    if not skip_tool_request_middleware:
+    if not skip_tool_request_middleware and not _role_locked:
         try:
             from hermes_cli.middleware import apply_tool_request_middleware
 
@@ -1316,7 +1446,7 @@ def handle_function_call(
         # gate denied/timed-out/errored (fail-closed). Observer plugins see
         # the hook on that same pass. When skip=True, the caller already
         # fired it — do nothing here.
-        if not skip_pre_tool_call_hook:
+        if not skip_pre_tool_call_hook and not _role_locked:
             block_message: Optional[str] = None
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
@@ -1427,6 +1557,12 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    # Final-arguments authorization (B-001): re-check the role
+                    # gate on the exact bytes being dispatched, after every
+                    # rewrite layer has run.
+                    _final_denial = _authorize_role_dispatch(function_name, next_args)
+                    if _final_denial is not None:
+                        return _final_denial
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1435,13 +1571,17 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    # Final-arguments authorization (B-001) — see above.
+                    _final_denial = _authorize_role_dispatch(function_name, next_args)
+                    if _final_denial is not None:
+                        return _final_denial
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
-            if skip_tool_execution_middleware:
+            if skip_tool_execution_middleware or _role_locked:
                 result = _dispatch(function_args)
             else:
                 from hermes_cli.middleware import run_tool_execution_middleware
@@ -1488,7 +1628,7 @@ def handle_function_call(
         # field derivation and the payload dispatch.
         try:
             from hermes_cli.lifecycle import has_hook, invoke_hook
-            if has_hook("transform_tool_result"):
+            if has_hook("transform_tool_result") and not _role_locked:
                 status, error_type, error_message = _tool_result_observer_fields(
                     function_name,
                     result,

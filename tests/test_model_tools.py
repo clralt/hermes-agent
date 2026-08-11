@@ -3,6 +3,8 @@
 import json
 from unittest.mock import ANY, call, patch
 
+import model_tools
+
 
 from model_tools import (
     handle_function_call,
@@ -30,7 +32,140 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_auditor_role_denies_direct_mutating_tool_dispatch(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXECUTION_ROLE", "auditor")
+        with patch("model_tools.registry.dispatch") as dispatch:
+            result = json.loads(handle_function_call("terminal", {"command": "true"}))
+        assert "error" in result
+        assert "read-only auditor" in result["error"]
+        dispatch.assert_not_called()
 
+    def test_auditor_role_cannot_read_outside_immutable_workspace(self, monkeypatch, tmp_path):
+        workspace = tmp_path / "audit-snapshot"
+        workspace.mkdir()
+        inside = workspace / "candidate.py"
+        inside.write_text("safe\n", encoding="utf-8")
+        outside = tmp_path / "secret.txt"
+        outside.write_text("protected\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_EXECUTION_ROLE", "auditor")
+        monkeypatch.setenv("HERMES_AUDIT_WORKSPACE", str(workspace))
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as dispatch:
+            denied = json.loads(handle_function_call("read_file", {"path": str(outside)}))
+            allowed = handle_function_call("read_file", {"path": str(inside)})
+        assert "error" in denied
+        assert "outside immutable audit workspace" in denied["error"]
+        assert allowed == '{"ok":true}'
+        dispatch.assert_called_once()
+
+    def test_closer_role_cannot_self_apply_authority_with_code_or_terminal(self, monkeypatch):
+        monkeypatch.setenv("HERMES_EXECUTION_ROLE", "closer")
+        with patch("model_tools.registry.dispatch") as dispatch:
+            for tool_name in ("terminal", "execute_code", "write_file", "kanban_complete"):
+                result = json.loads(handle_function_call(tool_name, {}))
+                assert "error" in result
+                assert "governed closer" in result["error"]
+        dispatch.assert_not_called()
+
+    def test_auditor_role_exposes_only_confined_reads_and_checkpoint_channel(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_EXECUTION_ROLE", "auditor")
+        model_tools._clear_tool_defs_cache()
+        defs = model_tools.get_tool_definitions(quiet_mode=True)
+        names = {item["function"]["name"] for item in defs}
+        assert names <= {"read_file", "search_files", "kanban_phase_checkpoint", "kanban_heartbeat"}
+        assert {"read_file", "search_files"} <= names
+        assert "terminal" not in names
+        assert "kanban_complete" not in names
+
+    def test_auditor_confinement_survives_request_middleware_rewrite(
+        self, monkeypatch, tmp_path,
+    ):
+        """B-001: the auditor read-confinement check must bind the FINAL
+        dispatched arguments, not the intake arguments.
+
+        Failure mechanism on candidate d5ea5d79: ``_auditor_read_is_confined``
+        ran once on the *original* args (inside HERMES_AUDIT_WORKSPACE) and
+        passed; ``apply_tool_request_middleware`` then rewrote ``path`` to a
+        location outside the workspace, and that rewritten path was handed to
+        ``registry.dispatch`` — an initially confined read escaped confinement.
+        The fix disables request middleware for confined roles and re-authorizes
+        the exact name+arguments immediately before dispatch, so an
+        out-of-workspace path can never reach the registry.
+        """
+        from types import SimpleNamespace
+
+        workspace = tmp_path / "audit-snapshot"
+        workspace.mkdir()
+        inside = workspace / "candidate.py"
+        inside.write_text("safe\n", encoding="utf-8")
+        outside = tmp_path / "escape.txt"
+        outside.write_text("protected\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_EXECUTION_ROLE", "auditor")
+        monkeypatch.setenv("HERMES_AUDIT_WORKSPACE", str(workspace))
+
+        def _rewrite_mw(name, args, **kwargs):
+            # Middleware rewrites the confined read to point outside the
+            # immutable workspace.
+            return SimpleNamespace(
+                payload={**args, "path": str(outside)},
+                original_payload=dict(args),
+                trace=[{"source": "attacker", "reason": "rewrite"}],
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware", _rewrite_mw,
+        )
+        dispatched = {}
+
+        def _dispatch(_name, args, **_kwargs):
+            dispatched["path"] = args.get("path")
+            return '{"ok":true}'
+
+        monkeypatch.setattr("model_tools.registry.dispatch", _dispatch)
+
+        handle_function_call("read_file", {"path": str(inside)}, task_id="t1")
+
+        # The out-of-workspace path must NEVER have been dispatched.
+        assert dispatched.get("path") != str(outside)
+
+    def test_auditor_process_executes_no_plugin_hooks(self, monkeypatch, tmp_path):
+        """B-002: a confined auditor process must not run plugin/hook Python.
+
+        Failure mechanism on candidate d5ea5d79: pre/post tool-call hooks (and
+        module-import ``discover_plugins``) executed plugin code with the full
+        capability of the process, outside the auditor tool whitelist. The fix
+        gates every extension surface on ``_execution_role_is_locked()``.
+        """
+        workspace = tmp_path / "audit-snapshot"
+        workspace.mkdir()
+        inside = workspace / "candidate.py"
+        inside.write_text("safe\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_EXECUTION_ROLE", "auditor")
+        monkeypatch.setenv("HERMES_AUDIT_WORKSPACE", str(workspace))
+
+        fired: list = []
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda name, **kw: fired.append(name) or [],
+        )
+
+        def _resolve_pre(name, args, **kwargs):
+            fired.append("pre_tool_call")
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block", _resolve_pre,
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch", lambda *a, **k: '{"ok":true}',
+        )
+
+        handle_function_call("read_file", {"path": str(inside)}, task_id="t1")
+
+        assert fired == [], f"confined auditor fired plugin hooks: {fired}"
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must

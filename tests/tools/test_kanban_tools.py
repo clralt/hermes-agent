@@ -350,6 +350,65 @@ def test_heartbeat_extends_claim_expires(worker_env):
     )
 
 
+def test_phase_checkpoint_requires_object_json(worker_env, monkeypatch):
+    """kanban_phase_checkpoint argument validation (F-003 surface).
+
+    Regression coverage for the phase-checkpoint tool handler: a missing,
+    non-JSON, or non-object ``checkpoint_json`` must be rejected with a clear
+    tool error and must never reach ``save_phase_checkpoint``. Embedded here so
+    the focused gate that exercises this handler is auditable from the dossier
+    bytes (revision-4 finding B-008: this test file was previously executed by
+    the focused gate but not embedded).
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # The handler requires a dispatcher-owned active run before it validates
+    # checkpoint_json; pin HERMES_KANBAN_RUN_ID to the worker's claimed run so
+    # the argument-validation branch is what is exercised.
+    conn = kb.connect()
+    try:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    missing = json.loads(kt._handle_phase_checkpoint({}))
+    assert missing.get("ok") is not True
+    assert "checkpoint_json is required" in missing.get("error", "")
+
+    bad_json = json.loads(
+        kt._handle_phase_checkpoint({"checkpoint_json": "{not json"})
+    )
+    assert bad_json.get("ok") is not True
+    assert "must be valid JSON" in bad_json.get("error", "")
+
+    non_object = json.loads(
+        kt._handle_phase_checkpoint({"checkpoint_json": "[1, 2, 3]"})
+    )
+    assert non_object.get("ok") is not True
+    assert "must decode to an object" in non_object.get("error", "")
+
+
+def test_phase_checkpoint_rejects_foreign_task_id(worker_env):
+    """A worker cannot checkpoint a task that isn't its own dispatcher-owned run."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="sibling-checkpoint")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_phase_checkpoint({
+        "task_id": other, "checkpoint_json": json.dumps({"schema_version": 1}),
+    }))
+    assert out.get("ok") is not True
+    assert "refusing to mutate" in out.get("error", "")
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({

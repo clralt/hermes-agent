@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "task_id": "HERMES-RESUMABLE-EXECUTION",
+  "candidate_id_prefix": "hermes-resumable",
+  "base_commit": "aaf0fbfa95180a2ce23b1a2e2d5b0bff26f7edba",
+  "base_tree": "129fc4679c27c085479e699cf72d25c38c6968a6",
+  "failed_candidate_tree": "13b0b7555263987a351f60a89eb2087c26f5565b",
+  "failed_dossier_sha256": "b01132dfc4714f2855189b1e3ec6b1041a95dffa362f31319c540d34eb721265",
+  "failed_signed_verdict_sha256": "43f778b31a18da462d0ae61e26e59874a7dbc005c1097f84672c8eea7c141886",
+  "scope": {
+    "candidate_paths": [
+      ".governance/HERMES-RESUMABLE-EXECUTION/CONTRACT.json",
+      ".governance/HERMES-RESUMABLE-EXECUTION/EVIDENCE_MANIFEST.json",
+      ".governance/HERMES-RESUMABLE-EXECUTION/SIGNED_VERDICT_SCHEMA.json",
+      ".governance/HERMES-RESUMABLE-EXECUTION/TEST_EVIDENCE.json",
+      "agent/turn_finalizer.py",
+      "hermes_cli/audit_verdict.py",
+      "hermes_cli/kanban_db.py",
+      "hermes_cli/resumable_execution.py",
+      "model_tools.py",
+      "tests/agent/test_turn_finalizer_iteration_limit_exit.py",
+      "tests/hermes_cli/test_audit_verdict.py",
+      "tests/hermes_cli/test_kanban_boards.py",
+      "tests/hermes_cli/test_kanban_core_functionality.py",
+      "tests/hermes_cli/test_kanban_db.py",
+      "tests/hermes_cli/test_kanban_resumable_execution.py",
+      "tests/hermes_cli/test_kanban_worker_session_source.py",
+      "tests/hermes_cli/test_kanban_worker_spawn_toolsets.py",
+      "tests/hermes_cli/test_kanban_worker_terminal_cwd.py",
+      "tests/run_agent/test_run_agent.py",
+      "tests/test_model_tools.py",
+      "tests/tools/test_kanban_tools.py",
+      "tools/kanban_tools.py",
+      "website/docs/reference/tools-reference.md",
+      "website/docs/user-guide/features/resumable-execution.md"
+    ],
+    "ignored_runtime_paths": [
+      ".runtime/**"
+    ],
+    "external_actions_authorized": false
+  },
+  "acceptance_criteria": {
+    "F-001": "No caller-controlled completion bypass; governed completion requires a durable accepted signed-verdict receipt bound to the authority task.",
+    "F-002": "Detached Ed25519 verdict verification binds exact task, authority task, audit checkpoint, candidate tree, contract, evidence manifest, dossier, producer, reviewer, model, effort, signer, and freshness.",
+    "F-003": "Auditor and closer model processes have attenuated tool schemas and dispatch guards; auditor reads are confined to a materialized non-writable candidate snapshot.",
+    "F-004": "Every subprocess waits on a controller-owned start gate until durable PID ownership is recorded; persistence failure terminates and waits for the child.",
+    "F-005": "Legacy rows migrate audit classification as null/UNKNOWN and fail closed until explicit classification.",
+    "F-006": "Checkpoint state has a durable content-addressed manifest/object set, actual bounded restoration, explicit ignored-path inclusion, and refusal to delete unbound new data.",
+    "F-007": "This task-bound contract, signed-verdict schema, evidence manifest, and machine-readable test evidence are candidate bytes and are embedded byte-verbatim in the dossier.",
+    "F-008": "The dossier includes exact commands, complete focused output, full-suite exploration result, and artifact digests rather than summary-only claims."
+  },
+  "required_verification": [
+    "scripts/run_tests.sh focused touched-surface test files",
+    "scripts/run_tests.sh full suite exploration",
+    "git diff --check",
+    "Python compile check for changed Python files",
+    "deterministic candidate tree computed twice with a temporary index"
+  ],
+  "audit": {
+    "desktop_pull_only": true,
+    "primary_reviewer": {
+      "reviewer_identity": "desktop-fable-5-read-only",
+      "provider": "fable",
+      "model": "claude-fable-5",
+      "reasoning_effort": "provider-controlled-nonempty"
+    },
+    "accepted_reviewers": [
+      {
+        "reviewer_identity": "desktop-fable-5-read-only",
+        "provider": "fable",
+        "model": "claude-fable-5"
+      },
+      {
+        "reviewer_identity": "codex-high-independent-auditor",
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "capacity_only_fallback": true
+      }
+    ],
+    "fallback_condition": "Codex High is permitted only after the Fable 5 transport returns a provider-capacity exhaustion classification; a substantive Fable FAIL must never be replaced by fallback review.",
+    "verdict_schema_path": ".governance/HERMES-RESUMABLE-EXECUTION/SIGNED_VERDICT_SCHEMA.json",
+    "producer_must_not_sign_or_audit": true
+  },
+  "terminal_state_before_desktop_verdict": "BLOCKED_PENDING_DESKTOP_AUDIT"
+}

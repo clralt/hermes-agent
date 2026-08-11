@@ -39,11 +39,13 @@ def _make_task(kb, *, assignee: str = "w"):
 
 def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_set_worker_pid", lambda *a, **kw: None)
 
     captured: dict = {}
 
     class FakeProc:
         pid = 4242
+        def terminate(self): pass
 
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)

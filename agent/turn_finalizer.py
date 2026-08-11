@@ -54,6 +54,130 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def _execution_role_is_locked() -> bool:
+    """True in confined auditor/closer processes: no plugin hook execution."""
+    return os.environ.get("HERMES_EXECUTION_ROLE", "").strip().lower() in {
+        "auditor", "closer",
+    }
+
+
+def _yield_kanban_task_checkpoint(agent, final_response, *, reason, logger) -> bool:
+    """Persist a durable checkpoint and atomically requeue the bound kanban task.
+
+    Shared by the iteration-cap fallback and the nonterminal process-exit
+    guard (revision-4 finding B-004): EVERY finite worker exit that leaves the
+    task ``running`` must produce a complete machine-readable checkpoint and an
+    atomically enqueued continuation — an ordinary clean exit without
+    ``kanban_complete``/``kanban_block`` previously retried as a protocol
+    violation with no checkpoint at all.
+
+    Returns True when a checkpoint/terminal transition was applied, False when
+    nothing was needed (no kanban binding, task already terminal, or foreign
+    run). Raises on persistence failure — callers decide whether that is fatal.
+    """
+    _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+    if not _kanban_task:
+        return False
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.resumable_execution import build_emergency_checkpoint
+    _conn = _kb.connect()
+    try:
+        _task = _kb.get_task(_conn, _kanban_task)
+        if _task is None or _task.current_run_id is None:
+            raise ValueError("kanban checkpoint yield has no active task run")
+        if getattr(_task, "status", "running") != "running":
+            # Worker already applied a governed terminal transition
+            # (kanban_complete / kanban_block) — nothing to checkpoint.
+            return False
+        _run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or _task.current_run_id)
+        if _run_id != _task.current_run_id:
+            raise ValueError("kanban checkpoint yield run identity diverged")
+        _checkpoint = _kb.get_saved_phase_checkpoint(
+            _conn, _kanban_task, _run_id,
+        )
+        if _checkpoint is None:
+            _previous = _kb.get_latest_continuation_checkpoint(
+                _conn, _kanban_task,
+            )
+            _checkpoint = build_emergency_checkpoint(
+                task=_task, run_id=_run_id, agent=agent,
+                summary=final_response,
+                previous=(_previous.payload if _previous else None),
+                yield_reason=reason,
+            )
+        _terminal = _checkpoint.get("terminal_state")
+        if _terminal and _terminal != "FAILED_RECOVERABLE":
+            _kb.apply_terminal_checkpoint(
+                _conn, _kanban_task, checkpoint=_checkpoint,
+                expected_run_id=_run_id, result=final_response,
+            )
+            logger.info(
+                "task %s reached governed terminal state %s at %s",
+                _kanban_task, _terminal, reason,
+            )
+        elif _checkpoint.get("work_complete"):
+            # Backward-compatible no-work-left path for a validated
+            # closer checkpoint that predates explicit terminal_state.
+            _kb.complete_task(
+                _conn, _kanban_task,
+                result=final_response or "Completed before worker exit",
+            )
+            logger.info(
+                "task %s completed immediately at %s; no continuation enqueued",
+                _kanban_task, reason,
+            )
+        else:
+            _cp = _kb.yield_task_for_continuation(
+                _conn, _kanban_task, checkpoint=_checkpoint,
+                expected_run_id=_run_id, reason=reason,
+            )
+            logger.info(
+                "enqueued continuation %d checkpoint %s for task %s (%s)",
+                _cp.continuation_number, _cp.checkpoint_sha256,
+                _kanban_task, reason,
+            )
+        return True
+    finally:
+        try:
+            _conn.close()
+        except Exception:
+            pass
+
+
+# Nonterminal process-exit guard (B-004). The last finalize_turn of a
+# dispatcher-owned worker arms this state; at interpreter exit — the moment an
+# "ordinary clean exit" becomes observable — the guard checkpoints and requeues
+# the task if no governed terminal transition ever happened. Goal-mode workers
+# run several turns in one process, so the durable yield must happen at process
+# exit, not at each intermediate turn.
+_NONTERMINAL_EXIT_STATE: dict = {
+    "registered": False, "agent": None, "summary": None,
+}
+
+
+def _finalize_nonterminal_worker_exit() -> None:
+    """atexit hook: durably checkpoint a worker that exits without a terminal
+    kanban call. Never raises (atexit); failure is logged CRITICAL and the
+    dispatcher's protocol-violation accounting remains as the backstop."""
+    agent = _NONTERMINAL_EXIT_STATE.get("agent")
+    if agent is None:
+        return
+    _NONTERMINAL_EXIT_STATE["agent"] = None
+    import logging
+    logger = logging.getLogger("agent.conversation_loop")
+    try:
+        _yield_kanban_task_checkpoint(
+            agent, _NONTERMINAL_EXIT_STATE.get("summary"),
+            reason="CLEAN_EXIT_WITHOUT_TERMINAL_CALL", logger=logger,
+        )
+    except Exception:
+        logger.critical(
+            "Failed to durably checkpoint nonterminal worker exit for task %s",
+            os.environ.get("HERMES_KANBAN_TASK"),
+            exc_info=True,
+        )
+
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -91,6 +215,11 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    # Auditor and exact-tree closer processes are authority-confined for their
+    # whole lifetime. The dispatch guard alone is insufficient: finalization
+    # otherwise executes extension Python after the model's last tool call.
+    _extensions_locked = _execution_role_is_locked()
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -143,53 +272,27 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
-            try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+        # An iteration cap is a normal process timeslice for dispatcher-owned
+        # work, never a failure or terminal task state. Persist an exact durable
+        # handoff and atomically make the same exclusive task eligible again.
+        try:
+            _yield_kanban_task_checkpoint(
+                agent, final_response,
+                reason="ITERATION_CAP_REACHED", logger=logger,
+            )
+            # A durable checkpoint already exists for this run; the process-exit
+            # guard must not enqueue a second continuation.
+            _NONTERMINAL_EXIT_STATE["agent"] = None
+        except Exception:
+            # This is a concrete persistence/control-plane dependency
+            # failure, not permission to silently abandon or reinterpret
+            # the task. Surface it loudly so supervisor recovery can retry.
+            logger.critical(
+                "Failed to durably checkpoint iteration yield for task %s",
+                os.environ.get("HERMES_KANBAN_TASK"),
+                exc_info=True,
+            )
+            raise
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -372,6 +475,7 @@ def finalize_turn(
                 # iterating) return value over the transcript, wiping it.
                 if (
                     _compressor
+                    and not _extensions_locked
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
@@ -555,7 +659,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _extensions_locked:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -578,7 +682,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _extensions_locked:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -599,29 +703,30 @@ def finalize_turn(
     # turn has finished, with the finalized transcript. Complements the
     # per-request select_context() hook (selection before the request;
     # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
-        # Forward the turn's canonical usage when the host has it. The loop
-        # stashes the most recent API response's usage dict (the same
-        # canonical buckets fed to ``update_from_response``) on the agent as
-        # ``_last_turn_usage``. It is ``None`` on turns that never reached a
-        # provider response (early failure / interrupt), which is exactly the
-        # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+    if not _extensions_locked:
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            # Forward the turn's canonical usage when the host has it. The loop
+            # stashes the most recent API response's usage dict (the same
+            # canonical buckets fed to ``update_from_response``) on the agent as
+            # ``_last_turn_usage``. It is ``None`` on turns that never reached a
+            # provider response (early failure / interrupt), which is exactly the
+            # contract: real usage when available, ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -731,19 +836,21 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (not _extensions_locked
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not _extensions_locked:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -752,6 +859,7 @@ def finalize_turn(
     # human-in-the-loop benefit from the review.
     if (
         final_response
+        and not _extensions_locked
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
@@ -775,24 +883,43 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    if not _extensions_locked:
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    # Arm the nonterminal process-exit guard (B-004). A dispatcher-owned worker
+    # that ends this turn on an ordinary clean text response — without ever
+    # calling kanban_complete/kanban_block — would otherwise leave the task
+    # ``running`` with no durable checkpoint and be retried as a protocol
+    # violation. Record the latest agent/summary so the atexit hook can persist
+    # a real continuation. It re-reads DB state and no-ops if a governed
+    # terminal transition already happened, or if this is not a kanban worker.
+    if os.environ.get("HERMES_KANBAN_TASK") and not interrupted:
+        try:
+            import atexit
+            if not _NONTERMINAL_EXIT_STATE.get("registered"):
+                atexit.register(_finalize_nonterminal_worker_exit)
+                _NONTERMINAL_EXIT_STATE["registered"] = True
+            _NONTERMINAL_EXIT_STATE["agent"] = agent
+            _NONTERMINAL_EXIT_STATE["summary"] = final_response
+        except Exception:
+            logger.debug("could not arm nonterminal worker-exit guard", exc_info=True)
 
     return result

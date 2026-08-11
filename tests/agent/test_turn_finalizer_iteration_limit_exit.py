@@ -46,6 +46,7 @@ class _LimitAgent:
         self.persisted_messages = None
         self._handle_max_iterations_called = False
         self._completion_explainer = completion_explainer
+        self.extension_calls = []
 
     def _handle_max_iterations(self, messages, api_call_count):
         self._handle_max_iterations_called = True
@@ -85,7 +86,10 @@ class _LimitAgent:
         pass
 
     def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
+        self.extension_calls.append("external_memory")
+
+    def _spawn_background_review(self, **_kwargs):
+        self.extension_calls.append("background_review")
 
 
 def _finalize(
@@ -112,6 +116,85 @@ def _finalize(
         _turn_exit_reason=exit_reason,
         _pending_verification_response=pending_verification_response,
     )
+
+
+@pytest.mark.parametrize("role", ["auditor", "closer"])
+def test_locked_execution_role_suppresses_entire_extension_lifecycle(
+    monkeypatch, role
+):
+    agent = _LimitAgent(max_iterations=60, budget_remaining=1)
+    agent.context_compressor = SimpleNamespace(
+        last_prompt_tokens=0,
+        _micro_compact_enabled=True,
+        _micro_compact=lambda messages: (
+            agent.extension_calls.append("micro_compact") or messages
+        ),
+    )
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = ["skill_manage"]
+    monkeypatch.setenv("HERMES_EXECUTION_ROLE", role)
+
+    def invoke_hook(name, **_kwargs):
+        agent.extension_calls.append(name)
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke_hook)
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_args, **_kwargs: agent.extension_calls.append("context_engine"),
+    )
+
+    _finalize(
+        agent,
+        final_response="done",
+        exit_reason="text_response(4 chars)",
+        api_call_count=1,
+    )
+
+    assert agent.extension_calls == []
+
+
+def test_normal_execution_role_runs_expected_extension_lifecycle(monkeypatch):
+    agent = _LimitAgent(max_iterations=60, budget_remaining=1)
+    agent.context_compressor = SimpleNamespace(
+        last_prompt_tokens=0,
+        _micro_compact_enabled=True,
+        _micro_compact=lambda messages: (
+            agent.extension_calls.append("micro_compact") or messages
+        ),
+    )
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = ["skill_manage"]
+    monkeypatch.delenv("HERMES_EXECUTION_ROLE", raising=False)
+
+    def invoke_hook(name, **_kwargs):
+        agent.extension_calls.append(name)
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke_hook)
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_args, **_kwargs: agent.extension_calls.append("context_engine"),
+    )
+
+    _finalize(
+        agent,
+        final_response="done",
+        exit_reason="text_response(4 chars)",
+        api_call_count=1,
+    )
+
+    assert agent.extension_calls == [
+        "micro_compact",
+        "transform_llm_output",
+        "post_llm_call",
+        "context_engine",
+        "external_memory",
+        "background_review",
+        "on_session_end",
+    ]
 
 
 
@@ -166,14 +249,53 @@ def test_pending_response_does_not_mask_later_terminal_exit(
 
 
 def test_pending_response_records_kanban_timeout(monkeypatch):
+    """B-004: iteration cap must enqueue a durable continuation checkpoint.
+
+    An ordinary iteration cap is a normal task timeslice, not a failure. The
+    dispatcher-owned worker must persist a complete machine-readable checkpoint
+    and atomically requeue the task for continuation instead of recording a
+    failure or retrying as a protocol violation.
+
+    Failure mechanism on pre-B-004 code: no checkpoint was built; the task was
+    retried as a protocol violation or had _record_task_failure called on it
+    rather than yield_task_for_continuation.
+    """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "99")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
-    agent = _LimitAgent()
 
+    from hermes_cli.kanban_db import Task
+    fake_task = Task(
+        id="task-123",
+        title="test task",
+        body=None,
+        assignee="coder",
+        status="running",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path="/tmp",
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+        current_run_id=99,
+    )
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda _conn, _tid: fake_task)
+    fake_cp = {"task_id": "task-123", "schema_version": 1, "worker": {}}
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.get_saved_phase_checkpoint",
+        lambda *_a, **_kw: fake_cp,
+    )
+    yield_mock = MagicMock(name="yield_task_for_continuation")
+    yield_mock.return_value = SimpleNamespace(continuation_number=1, checkpoint_sha256="a" * 64)
+    monkeypatch.setattr("hermes_cli.kanban_db.yield_task_for_continuation", yield_mock)
+
+    agent = _LimitAgent()
     result = _finalize(
         agent,
         final_response=None,
@@ -182,17 +304,12 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    record.assert_called_once_with(
+    yield_mock.assert_called_once_with(
         conn,
         "task-123",
-        error=(
-            "Iteration budget exhausted (60/60) — task could not complete "
-            "within the allowed iterations"
-        ),
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        checkpoint=fake_cp,
+        expected_run_id=99,
+        reason="ITERATION_CAP_REACHED",
     )
 
 

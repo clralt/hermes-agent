@@ -89,6 +89,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from .resumable_execution import (
+    INDEPENDENT_AUDIT_REVIEWER_POLICIES as _INDEPENDENT_AUDIT_REVIEWERS,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -133,6 +136,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_CREATED_WORK_ITEM_KINDS = {"fresh", "remediation", "audit"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -993,6 +997,14 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Durable execution routing. ``continuation`` outranks unrelated fresh
+    # work at dispatch time; the latest immutable checkpoint supplies the
+    # clean worker's restoration contract.
+    work_item_kind: str = "fresh"
+    continuation_count: int = 0
+    latest_checkpoint_id: Optional[int] = None
+    terminal_state: Optional[str] = None
+    requires_independent_audit: Optional[bool] = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1087,6 +1099,27 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            work_item_kind=(
+                row["work_item_kind"] if "work_item_kind" in keys else "fresh"
+            ),
+            continuation_count=(
+                int(row["continuation_count"])
+                if "continuation_count" in keys and row["continuation_count"] is not None
+                else 0
+            ),
+            latest_checkpoint_id=(
+                int(row["latest_checkpoint_id"])
+                if "latest_checkpoint_id" in keys and row["latest_checkpoint_id"] is not None
+                else None
+            ),
+            terminal_state=(
+                row["terminal_state"] if "terminal_state" in keys else None
+            ),
+            requires_independent_audit=(
+                None if "requires_independent_audit" not in keys
+                or row["requires_independent_audit"] is None
+                else bool(row["requires_independent_audit"])
+            ),
         )
 
 
@@ -1141,6 +1174,40 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+        )
+
+
+@dataclass
+class ContinuationCheckpoint:
+    id: int
+    task_id: str
+    source_run_id: int
+    continuation_number: int
+    reason: str
+    checkpoint_sha256: str
+    payload: dict
+    created_at: int
+    resumed_run_id: Optional[int]
+    disposition: str
+
+    @property
+    def completed_steps(self) -> list:
+        return list(self.payload.get("completed_steps") or [])
+
+    @property
+    def remaining_steps(self) -> list:
+        return list(self.payload.get("remaining_steps") or [])
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ContinuationCheckpoint":
+        return cls(
+            id=int(row["id"]), task_id=row["task_id"],
+            source_run_id=int(row["source_run_id"]),
+            continuation_number=int(row["continuation_number"]),
+            reason=row["reason"], checkpoint_sha256=row["checkpoint_sha256"],
+            payload=json.loads(row["payload"]), created_at=int(row["created_at"]),
+            resumed_run_id=(int(row["resumed_run_id"]) if row["resumed_run_id"] is not None else None),
+            disposition=row["disposition"],
         )
 
 
@@ -1274,7 +1341,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable queue identity. Continuations are selected before unrelated
+    -- fresh work and bind to latest_checkpoint_id.
+    work_item_kind       TEXT NOT NULL DEFAULT 'fresh',
+    continuation_count   INTEGER NOT NULL DEFAULT 0,
+    latest_checkpoint_id INTEGER,
+    terminal_state       TEXT,
+    requires_independent_audit INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1329,6 +1403,59 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Immutable machine-readable handoffs between bounded worker invocations.
+-- The partial unique index below permits at most one eligible continuation
+-- for an exclusive task while retaining the complete history for observability.
+CREATE TABLE IF NOT EXISTS continuation_checkpoints (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    source_run_id       INTEGER NOT NULL,
+    continuation_number INTEGER NOT NULL,
+    reason              TEXT NOT NULL,
+    checkpoint_sha256   TEXT NOT NULL,
+    payload             TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    resumed_run_id      INTEGER,
+    disposition         TEXT NOT NULL DEFAULT 'pending',
+    UNIQUE(task_id, source_run_id, checkpoint_sha256),
+    UNIQUE(task_id, continuation_number)
+);
+
+-- Replay ledger for external signed authority. A verdict id and its exact
+-- canonical bytes may authorize only the task named by the desktop signer.
+CREATE TABLE IF NOT EXISTS audit_authority_receipts (
+    verdict_id          TEXT PRIMARY KEY,
+    verdict_sha256      TEXT NOT NULL UNIQUE,
+    authority_task_id   TEXT NOT NULL,
+    audit_task_id       TEXT NOT NULL,
+    candidate_tree      TEXT NOT NULL,
+    accepted_run_id     INTEGER NOT NULL,
+    signer_key_id       TEXT NOT NULL,
+    accepted_at         INTEGER NOT NULL,
+    consumed_at         INTEGER,
+    FOREIGN KEY(authority_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(accepted_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+-- Production desktop verdict intake. This ledger is distinct from the
+-- one-shot authority receipt consumed by the closer's terminal transition:
+-- intake wakes the closer; the receipt proves that closer actually consumed
+-- the authority for one exact run.
+CREATE TABLE IF NOT EXISTS audit_verdict_intakes (
+    verdict_id          TEXT PRIMARY KEY,
+    verdict_sha256      TEXT NOT NULL UNIQUE,
+    authority_task_id   TEXT NOT NULL UNIQUE,
+    audit_task_id       TEXT NOT NULL,
+    audit_run_id        INTEGER NOT NULL,
+    audit_checkpoint_sha256 TEXT NOT NULL,
+    candidate_tree      TEXT NOT NULL,
+    signer_key_id       TEXT NOT NULL,
+    verdict_json        TEXT NOT NULL,
+    accepted_at         INTEGER NOT NULL,
+    FOREIGN KEY(authority_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(audit_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1372,6 +1499,9 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_continuations_task     ON continuation_checkpoints(task_id, continuation_number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuations_one_pending
+    ON continuation_checkpoints(task_id) WHERE disposition = 'pending';
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2323,6 +2453,45 @@ def init_db(
     return path
 
 
+def _migrate_independent_audit_classification(conn: sqlite3.Connection) -> None:
+    """Replace the rejected default-false column with a conservative tri-state."""
+    info = {
+        row["name"]: row for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    current = info.get("requires_independent_audit")
+    legacy = info.get("requires_independent_audit_legacy")
+    if current is not None:
+        default = str(current["dflt_value"] or "").strip("() ")
+        rejected_shape = bool(current["notnull"]) or default == "0"
+        if not rejected_shape:
+            return
+        if legacy is not None:
+            raise RuntimeError(
+                "ambiguous audit classification schema: current and legacy "
+                "columns both exist while current remains default-false"
+            )
+        conn.execute(
+            "ALTER TABLE tasks RENAME COLUMN requires_independent_audit "
+            "TO requires_independent_audit_legacy"
+        )
+    elif legacy is None:
+        _add_column_if_missing(
+            conn, "tasks", "requires_independent_audit",
+            "requires_independent_audit INTEGER",
+        )
+        return
+
+    _add_column_if_missing(
+        conn, "tasks", "requires_independent_audit",
+        "requires_independent_audit INTEGER",
+    )
+    conn.execute(
+        "UPDATE tasks SET requires_independent_audit = "
+        "CASE WHEN requires_independent_audit_legacy = 1 THEN 1 ELSE NULL END "
+        "WHERE requires_independent_audit IS NULL"
+    )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2473,6 +2642,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "work_item_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "work_item_kind",
+            "work_item_kind TEXT NOT NULL DEFAULT 'fresh'",
+        )
+    if "continuation_count" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "continuation_count",
+            "continuation_count INTEGER NOT NULL DEFAULT 0",
+        )
+    if "latest_checkpoint_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "latest_checkpoint_id", "latest_checkpoint_id INTEGER",
+        )
+    if "terminal_state" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "terminal_state", "terminal_state TEXT",
+        )
+    # Historical rows have no authoritative governance classification. This
+    # also repairs boards already laundered by the rejected NOT NULL DEFAULT 0
+    # implementation rather than trusting the mere existence of the column.
+    _migrate_independent_audit_classification(conn)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2482,8 +2673,39 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # is cheap thanks to ``IF NOT EXISTS`` and stays correct on fresh DBs
     # (where the columns already exist from SCHEMA_SQL).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
+    # Idempotency is an enforced active-row identity, not a lookup hint. Legacy
+    # boards may contain duplicates created by the former check-before-txn
+    # implementation. Preserve those rows and fail closed rather than silently
+    # deleting or choosing one as canonical.
+    final_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    # A reduced legacy fixture may already contain every additive column while
+    # predating ``status``. In that shape all keyed rows are conservatively
+    # treated as active: there is no trustworthy archived classification to
+    # exclude. Duplicate keys still fail closed and no legacy row is deleted or
+    # merged.
+    idempotency_predicate = (
+        "idempotency_key IS NOT NULL AND idempotency_key != ''"
+    )
+    if "status" in final_cols:
+        idempotency_predicate += " AND status != 'archived'"
+    conflict = conn.execute(
+        "SELECT idempotency_key, count(*) AS n FROM tasks WHERE "
+        + idempotency_predicate
+        + " GROUP BY idempotency_key HAVING count(*) > 1 "
+        "ORDER BY idempotency_key LIMIT 1"
+    ).fetchone()
+    if conflict is not None:
+        raise RuntimeError(
+            "conflicting active idempotency rows prevent uniqueness migration: "
+            f"key={conflict['idempotency_key']!r} count={conflict['n']}"
+        )
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
+        "CREATE UNIQUE INDEX idx_tasks_idempotency "
+        "ON tasks(idempotency_key) "
+        "WHERE " + idempotency_predicate
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
@@ -2502,6 +2724,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    receipt_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='audit_authority_receipts'"
+    ).fetchone() is not None
+    if receipt_table_exists:
+        receipt_cols = {
+            row["name"] for row in conn.execute(
+                "PRAGMA table_info(audit_authority_receipts)"
+            )
+        }
+        if "candidate_tree" not in receipt_cols:
+            _add_column_if_missing(
+                conn, "audit_authority_receipts", "candidate_tree", "candidate_tree TEXT",
+            )
+        if "accepted_run_id" not in receipt_cols:
+            _add_column_if_missing(
+                conn, "audit_authority_receipts", "accepted_run_id", "accepted_run_id INTEGER",
+            )
+        if "consumed_at" not in receipt_cols:
+            _add_column_if_missing(
+                conn, "audit_authority_receipts", "consumed_at", "consumed_at INTEGER",
+            )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -2878,6 +3123,11 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_GOVERNED_EXECUTION_IDENTITIES = frozenset({
+    "authorized-exact-tree-closer",
+})
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2906,6 +3156,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    work_item_kind: str = "fresh",
+    requires_independent_audit: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2949,9 +3201,17 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    idempotency_key = (
+        str(idempotency_key).strip() if idempotency_key is not None else ""
+    ) or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    # Dedicated authority identities are policy-classified; a caller cannot
+    # opt them out of independent audit by passing the default False value.
+    requires_independent_audit = bool(requires_independent_audit) or (
+        assignee in _GOVERNED_EXECUTION_IDENTITIES
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2962,6 +3222,10 @@ def create_task(
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
+        )
+    if work_item_kind not in VALID_CREATED_WORK_ITEM_KINDS:
+        raise ValueError(
+            f"work_item_kind must be one of {sorted(VALID_CREATED_WORK_ITEM_KINDS)}"
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
@@ -3116,21 +3380,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3158,6 +3407,17 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # The lookup and insert share one IMMEDIATE transaction. A
+                # concurrent retry waits for this writer, then observes and
+                # returns the one canonical active row.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' ORDER BY created_at, id LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row is not None:
+                        return row["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3217,8 +3477,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        work_item_kind, requires_independent_audit
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3244,6 +3505,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        work_item_kind,
+                        1 if requires_independent_audit else 0,
                     ),
                 )
                 for pid in parents:
@@ -3268,11 +3531,24 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "work_item_kind": work_item_kind,
+                        "requires_independent_audit": bool(requires_independent_audit) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
+            # Defense in depth for an external writer that races without using
+            # write_txn: the unique index still converges this retry on the
+            # durable canonical row instead of leaking a uniqueness exception.
+            if idempotency_key:
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' ORDER BY created_at, id LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if row is not None:
+                    return row["id"]
             if attempt == 1:
                 raise
             # Retry with a fresh id.
@@ -3429,11 +3705,18 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
-                (profile, task_id),
+                "last_failure_error = NULL, "
+                "requires_independent_audit = CASE WHEN ? THEN 1 "
+                "ELSE requires_independent_audit END WHERE id = ?",
+                (profile, profile in _GOVERNED_EXECUTION_IDENTITIES, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, "
+                "requires_independent_audit = CASE WHEN ? THEN 1 "
+                "ELSE requires_independent_audit END WHERE id = ?",
+                (profile, profile in _GOVERNED_EXECUTION_IDENTITIES, task_id),
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
 
@@ -4001,6 +4284,15 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    prior_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    try:
+        merged_metadata = json.loads(prior_row["metadata"] or "{}") if prior_row else {}
+    except Exception:
+        merged_metadata = {}
+    if metadata:
+        merged_metadata.update(metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -4021,7 +4313,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(merged_metadata, ensure_ascii=False) if merged_metadata else None,
             now,
             run_id,
         ),
@@ -4220,6 +4512,662 @@ def recompute_ready(
 
 
 # ---------------------------------------------------------------------------
+# Durable continuation checkpoints
+# ---------------------------------------------------------------------------
+
+def get_latest_continuation_checkpoint(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[ContinuationCheckpoint]:
+    row = conn.execute(
+        "SELECT * FROM continuation_checkpoints WHERE task_id=? "
+        "ORDER BY continuation_number DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    return ContinuationCheckpoint.from_row(row) if row is not None else None
+
+
+def list_continuation_checkpoints(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[ContinuationCheckpoint]:
+    rows = conn.execute(
+        "SELECT * FROM continuation_checkpoints WHERE task_id=? "
+        "ORDER BY continuation_number", (task_id,),
+    ).fetchall()
+    return [ContinuationCheckpoint.from_row(row) for row in rows]
+
+
+# Maps the closer checkpoint's terminal audit status to the status carried by
+# the independently signed desktop verdict that authorizes it. A governed
+# evidence kill is authorized by a signed FAIL verdict; a governed clean close
+# by a signed CLEAN verdict (revision-4 finding B-007: the kill branch
+# previously had no signed authority path at all and was unreachable).
+_CLOSER_AUDIT_TO_SIGNED_STATUS = {
+    "CLEAN": "CLEAN",
+    "KILLED_BY_EVIDENCE": "FAIL",
+}
+
+def _audit_reviewer_matches_policy(task: sqlite3.Row, checkpoint: Mapping[str, Any]) -> bool:
+    audit = checkpoint.get("audit") or {}
+    worker = checkpoint.get("worker") or {}
+    identity = str(audit.get("reviewer_identity") or "")
+    policy = _INDEPENDENT_AUDIT_REVIEWERS.get(identity)
+    if policy is None:
+        return False
+    provider, model, effort = policy
+    return (
+        task["assignee"] == identity
+        and task["provider_override"] == provider
+        and task["model_override"] == model
+        and (effort is None or task["reasoning_effort"] == effort)
+        and worker.get("identity") == identity
+        and worker.get("model") == model
+        and worker.get("reasoning_effort") == audit.get("reasoning_effort")
+        and audit.get("model") == model
+        and bool(str(audit.get("reasoning_effort") or "").strip())
+        and (effort is None or audit.get("reasoning_effort") == effort)
+    )
+
+
+def intake_signed_audit_verdict(
+    conn: sqlite3.Connection,
+    verdict: Mapping[str, Any],
+    *,
+    trust_store: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Verify a desktop CLEAN verdict and atomically wake its exact closer.
+
+    ``trust_store`` exists for an operator/controller that already loaded the
+    pinned public store; production callers normally omit it and use the same
+    operator-owned pinned-store loader as closer verification. No private key
+    or signing operation exists on this host.
+    """
+    from hermes_cli.audit_verdict import verify_signed_audit_verdict
+    from hermes_cli.resumable_execution import checkpoint_sha256, validate_checkpoint
+
+    if not isinstance(verdict, Mapping) or verdict.get("status") != "CLEAN":
+        raise ValueError("signed audit intake requires a CLEAN verdict object")
+    verdict_id = str(verdict.get("verdict_id") or "")
+    authority_task_id = str(verdict.get("authority_task_id") or "")
+    audit_task_id = str(verdict.get("audit_task_id") or "")
+    checkpoint_digest = str(verdict.get("audit_checkpoint_sha256") or "")
+    if not all((verdict_id, authority_task_id, audit_task_id, checkpoint_digest)):
+        raise ValueError("signed audit intake bindings are incomplete")
+
+    rows = conn.execute(
+        "SELECT r.id, r.metadata, r.status AS run_status, r.ended_at, "
+        "t.status AS task_status, t.current_run_id, t.assignee, "
+        "t.provider_override, t.model_override, t.reasoning_effort "
+        "FROM task_runs r JOIN tasks t ON t.id=r.task_id WHERE r.task_id=?",
+        (audit_task_id,),
+    ).fetchall()
+    matches = []
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+            checkpoint = metadata["phase_checkpoint"]
+            saved_sha = metadata["phase_checkpoint_sha256"]
+        except Exception:
+            continue
+        if saved_sha == checkpoint_digest and checkpoint_sha256(checkpoint) == checkpoint_digest:
+            matches.append((row, checkpoint))
+    if len(matches) != 1:
+        raise ValueError("signed audit intake requires one exact saved audit checkpoint")
+    audit_run, audit_checkpoint = matches[0]
+    validate_checkpoint(audit_checkpoint)
+    audit = audit_checkpoint.get("audit") or {}
+    if (
+        audit_checkpoint.get("execution_role") != "auditor"
+        or audit.get("status") != "CLEAN"
+        or not _audit_reviewer_matches_policy(audit_run, audit_checkpoint)
+    ):
+        raise ValueError("signed audit intake reviewer is outside independent-auditor policy")
+    bindings = audit_checkpoint.get("bindings") or {}
+    independence = audit.get("independence_provenance") or {}
+    expected = {
+        "authority_task_id": authority_task_id,
+        "audit_task_id": audit_task_id,
+        "status": "CLEAN",
+        "candidate_tree": bindings.get("candidate_tree"),
+        "contract_sha256": bindings.get("contract_sha256"),
+        "evidence_manifest_sha256": bindings.get("evidence_manifest_sha256"),
+        "dossier_sha256": bindings.get("dossier_sha256"),
+        "audit_checkpoint_sha256": checkpoint_digest,
+        "producer_identity": independence.get("producer_identity"),
+        "reviewer": {
+            "identity": audit.get("reviewer_identity"),
+            "model": audit.get("model"),
+            "reasoning_effort": audit.get("reasoning_effort"),
+        },
+    }
+    if any(value in (None, "") for value in expected.values()):
+        raise ValueError("signed audit intake exact bindings are incomplete")
+    if verdict.get("reviewer") != expected["reviewer"]:
+        raise ValueError("signed audit intake reviewer binding does not match checkpoint")
+    if trust_store is None:
+        # Reuse the existing operator-pinned loader and verifier boundary.
+        signed_probe = dict(audit_checkpoint)
+        signed_probe.setdefault("audit", {})["signed_verdict"] = dict(verdict)
+        signed_probe["task_id"] = authority_task_id
+        signed_probe.setdefault("audit", {}).setdefault("authority_provenance", {})[
+            "audit_task_id"
+        ] = audit_task_id
+        signed_probe["audit"]["authority_provenance"]["checkpoint_sha256"] = checkpoint_digest
+        receipt = _verify_signed_closer_verdict(signed_probe)
+    else:
+        receipt = verify_signed_audit_verdict(verdict, trust_store, expected=expected)
+    verdict_json = json.dumps(dict(verdict), sort_keys=True, separators=(",", ":"))
+
+    existing_id = conn.execute(
+        "SELECT * FROM audit_verdict_intakes WHERE verdict_id=?", (verdict_id,),
+    ).fetchone()
+    existing_sha = conn.execute(
+        "SELECT * FROM audit_verdict_intakes WHERE verdict_sha256=?",
+        (receipt["verdict_sha256"],),
+    ).fetchone()
+    for existing in (existing_id, existing_sha):
+        if existing is None:
+            continue
+        if (
+            existing["verdict_id"] != verdict_id
+            or existing["verdict_sha256"] != receipt["verdict_sha256"]
+            or existing["authority_task_id"] != authority_task_id
+            or existing["audit_task_id"] != audit_task_id
+            or existing["audit_run_id"] != audit_run["id"]
+            or existing["audit_checkpoint_sha256"] != checkpoint_digest
+            or existing["verdict_json"] != verdict_json
+        ):
+            raise ValueError("signed audit verdict intake conflicts with prior authority")
+        return authority_task_id
+
+    with write_txn(conn):
+        authority = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (authority_task_id,),
+        ).fetchone()
+        if authority is None:
+            raise ValueError("signed authority task does not exist")
+        if authority["status"] == "running" and authority["current_run_id"] is not None:
+            raise ValueError("signed authority task still has an active producer run")
+        current_audit = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id=? AND task_id=?",
+            (audit_run["id"], audit_task_id),
+        ).fetchone()
+        if current_audit is None or current_audit["status"] != "running" or current_audit["ended_at"] is not None:
+            raise ValueError("signed audit run is not active for atomic completion")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='completed', ended_at=?, "
+            "summary='Independent desktop audit CLEAN' WHERE id=?",
+            (now, audit_run["id"]),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=?, current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (now, audit_task_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', assignee='authorized-exact-tree-closer', "
+            "requires_independent_audit=1, current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, completed_at=NULL WHERE id=?",
+            (authority_task_id,),
+        )
+        conn.execute(
+            "INSERT INTO audit_verdict_intakes "
+            "(verdict_id, verdict_sha256, authority_task_id, audit_task_id, "
+            "audit_run_id, audit_checkpoint_sha256, candidate_tree, signer_key_id, "
+            "verdict_json, accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                verdict_id, receipt["verdict_sha256"], authority_task_id,
+                audit_task_id, audit_run["id"], checkpoint_digest,
+                receipt["candidate_tree"], receipt["signer_key_id"], verdict_json, now,
+            ),
+        )
+        _append_event(
+            conn, authority_task_id, "signed_audit_verdict_intake",
+            {"verdict_id": verdict_id, "audit_task_id": audit_task_id,
+             "audit_run_id": audit_run["id"], "checkpoint_sha256": checkpoint_digest},
+        )
+    return authority_task_id
+
+
+def _verify_signed_closer_verdict(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """Verify external desktop authority against an operator-pinned trust root."""
+    import hashlib
+    from pathlib import Path
+
+    from hermes_cli.audit_verdict import verify_signed_audit_verdict
+    from hermes_cli.config import load_config
+
+    audit = checkpoint.get("audit") or {}
+    closer_status = audit.get("status")
+    # None defaults to CLEAN; explicit invalid values are rejected after trust-store checks.
+    signed_status = "CLEAN" if closer_status is None else _CLOSER_AUDIT_TO_SIGNED_STATUS.get(str(closer_status))
+    signed = audit.get("signed_verdict")
+    if not isinstance(signed, Mapping):
+        raise ValueError("closer requires an independently signed audit verdict")
+    cfg = load_config() or {}
+    kanban_cfg = cfg.get("kanban") if isinstance(cfg.get("kanban"), Mapping) else {}
+    trust_path_raw = str((kanban_cfg or {}).get("audit_trust_store_path") or "").strip()
+    pinned_sha = str((kanban_cfg or {}).get("audit_trust_store_sha256") or "").strip().lower()
+    if not trust_path_raw or len(pinned_sha) != 64:
+        raise ValueError(
+            "kanban.audit_trust_store_path and audit_trust_store_sha256 are required"
+        )
+    trust_path = Path(trust_path_raw).expanduser()
+    if not trust_path.is_absolute() or trust_path.is_symlink() or not trust_path.is_file():
+        raise ValueError("audit trust store must be an absolute regular non-symlink file")
+    if os.name != "nt":
+        trust_stat = trust_path.stat()
+        if trust_stat.st_uid == os.geteuid() or trust_stat.st_mode & 0o022:
+            raise ValueError(
+                "audit trust store must be operator-owned and not writable by the worker"
+            )
+        parent = trust_path.parent
+        while True:
+            parent_stat = parent.stat()
+            if parent_stat.st_uid == os.geteuid() or parent_stat.st_mode & 0o022:
+                raise ValueError(
+                    "audit trust store parent chain must be operator-owned and non-writable"
+                )
+            if parent == parent.parent:
+                break
+            parent = parent.parent
+    trust_bytes = trust_path.read_bytes()
+    if len(trust_bytes) > 1024 * 1024:
+        raise ValueError("audit trust store exceeds 1 MiB")
+    if hashlib.sha256(trust_bytes).hexdigest() != pinned_sha:
+        raise ValueError("audit trust store does not match its pinned SHA-256")
+    try:
+        trust_store = json.loads(trust_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("audit trust store is not valid UTF-8 JSON") from exc
+    # Status gate: enforce only after trust-store has been verified.
+    if signed_status is None:
+        raise ValueError(
+            "closer audit status must be CLEAN or KILLED_BY_EVIDENCE for a "
+            "signed authority verdict"
+        )
+    bindings = checkpoint.get("bindings") or {}
+    authority = audit.get("authority_provenance") or {}
+    independence = audit.get("independence_provenance") or {}
+    expected = {
+        "task_id": checkpoint.get("task_id"),
+        "authority_task_id": checkpoint.get("task_id"),
+        "audit_task_id": authority.get("audit_task_id"),
+        "status": signed_status,
+        "candidate_tree": bindings.get("candidate_tree"),
+        "contract_sha256": bindings.get("contract_sha256"),
+        "evidence_manifest_sha256": bindings.get("evidence_manifest_sha256"),
+        "dossier_sha256": bindings.get("dossier_sha256"),
+        "audit_checkpoint_sha256": authority.get("checkpoint_sha256"),
+        "producer_identity": independence.get("producer_identity"),
+        "reviewer": {
+            "identity": audit.get("reviewer_identity"),
+            "model": audit.get("model"),
+            "reasoning_effort": audit.get("reasoning_effort"),
+        },
+    }
+    if any(value in (None, "") for key, value in expected.items() if key != "reviewer") or any(
+        value in (None, "") for value in expected["reviewer"].values()
+    ):
+        raise ValueError("closer signed audit verdict bindings are incomplete")
+    return verify_signed_audit_verdict(signed, trust_store, expected=expected)
+
+
+def _verify_trusted_closer_authority(
+    conn: sqlite3.Connection, checkpoint: Mapping[str, Any], *, closer_task_id: str,
+) -> dict[str, Any]:
+    """Bind a closer to a prior immutable checkpoint from a different audit task."""
+    from hermes_cli.resumable_execution import checkpoint_sha256, validate_checkpoint
+
+    audit = checkpoint.get("audit") or {}
+    authority = audit.get("authority_provenance") or {}
+    audit_task_id = authority.get("audit_task_id")
+    audit_run_id = authority.get("audit_run_id")
+    expected_sha = authority.get("checkpoint_sha256")
+    if not audit_task_id or audit_run_id is None or not expected_sha or audit_task_id == closer_task_id:
+        raise ValueError("closer audit authority must identify a separate completed audit task/run")
+    row = conn.execute(
+        "SELECT r.metadata, r.status AS run_status, r.outcome AS run_outcome, "
+        "t.status AS task_status, t.assignee, t.provider_override, "
+        "t.model_override, t.reasoning_effort "
+        "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
+        "WHERE r.id=? AND r.task_id=?",
+        (int(audit_run_id), str(audit_task_id)),
+    ).fetchone()
+    if row is None or row["task_status"] != "done":
+        raise ValueError("trusted audit task is missing or not completed")
+    if row["run_status"] != "done" or row["run_outcome"] != "completed":
+        raise ValueError("trusted audit run is missing or not completed successfully")
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+        audit_checkpoint = metadata["phase_checkpoint"]
+    except Exception as exc:
+        raise ValueError("trusted audit run has no readable phase checkpoint") from exc
+    validate_checkpoint(audit_checkpoint)
+    # The closer's own audit.status selects the required audit-checkpoint verdict:
+    # a CLEAN close binds a CLEAN audit; an evidence kill binds an audit whose
+    # status is KILLED_BY_EVIDENCE (B-007). Both are independently signed below.
+    _closer_audit_status = str((checkpoint.get("audit") or {}).get("status"))
+    if _closer_audit_status not in _CLOSER_AUDIT_TO_SIGNED_STATUS:
+        raise ValueError("closer audit status must be CLEAN or KILLED_BY_EVIDENCE")
+    if (
+        checkpoint_sha256(audit_checkpoint) != expected_sha
+        or audit_checkpoint.get("execution_role") != "auditor"
+        or (audit_checkpoint.get("audit") or {}).get("status") != _closer_audit_status
+        or not _audit_reviewer_matches_policy(row, audit_checkpoint)
+        or (audit_checkpoint.get("bindings") or {}).get("candidate_tree")
+           != (checkpoint.get("bindings") or {}).get("candidate_tree")
+        or (audit_checkpoint.get("bindings") or {}).get("dossier_sha256")
+           != (checkpoint.get("bindings") or {}).get("dossier_sha256")
+        or (audit_checkpoint.get("bindings") or {}).get("contract_sha256")
+           != (checkpoint.get("bindings") or {}).get("contract_sha256")
+        or (audit_checkpoint.get("bindings") or {}).get("evidence_sha256")
+           != (checkpoint.get("bindings") or {}).get("evidence_sha256")
+    ):
+        raise ValueError("closer authority does not bind the exact trusted audited bytes/evidence")
+    return _verify_signed_closer_verdict(checkpoint)
+
+
+def save_phase_checkpoint(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    checkpoint: Mapping[str, Any],
+    expected_run_id: int,
+) -> str:
+    """Durably replace this run's latest rich phase checkpoint.
+
+    This is a heartbeat-style update, not a yield and not an approval. It lets
+    the cap handler persist exact model-known progress instead of reconstructing
+    completed steps from prose after the budget is gone.
+    """
+    from hermes_cli.resumable_execution import (
+        checkpoint_sha256, validate_checkpoint,
+    )
+    payload = dict(checkpoint)
+    if payload.get("task_id") != task_id:
+        raise ValueError("checkpoint task_id does not match task")
+    if (payload.get("provenance") or {}).get("source_run_id") != expected_run_id:
+        raise ValueError("checkpoint source_run_id does not match active run")
+    validate_checkpoint(payload)
+    digest = checkpoint_sha256(payload)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id=? AND task_id=? "
+            "AND status='running' AND ended_at IS NULL",
+            (expected_run_id, task_id),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT current_run_id, status, assignee, provider_override, "
+            "model_override, reasoning_effort "
+            "FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if row is None or task is None or task["status"] != "running" or task["current_run_id"] != expected_run_id:
+            raise ValueError("phase checkpoint lost active-run ownership")
+        if payload.get("execution_role") == "auditor" and not _audit_reviewer_matches_policy(
+            task, payload,
+        ):
+            raise ValueError(
+                "auditor authority requires an approved independent reviewer/provider/model policy"
+            )
+        if payload.get("execution_role") == "closer":
+            if task["assignee"] != "authorized-exact-tree-closer":
+                raise ValueError("closer authority requires a dedicated exact-tree closer task")
+            _verify_trusted_closer_authority(conn, payload, closer_task_id=task_id)
+        try:
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        except Exception:
+            metadata = {}
+        metadata["phase_checkpoint"] = payload
+        metadata["phase_checkpoint_sha256"] = digest
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(metadata, sort_keys=True, separators=(",", ":")), expected_run_id),
+        )
+        _append_event(
+            conn, task_id, "phase_checkpoint_saved",
+            {"checkpoint_sha256": digest, "phase": payload.get("current_phase")},
+            run_id=expected_run_id,
+        )
+    return digest
+
+
+def get_saved_phase_checkpoint(
+    conn: sqlite3.Connection, task_id: str, run_id: int,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=? AND task_id=?",
+        (run_id, task_id),
+    ).fetchone()
+    if row is None or not row["metadata"]:
+        return None
+    try:
+        metadata = json.loads(row["metadata"])
+        payload = metadata.get("phase_checkpoint")
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def apply_terminal_checkpoint(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    checkpoint: Mapping[str, Any],
+    expected_run_id: int,
+    result: Optional[str] = None,
+) -> str:
+    """Apply only genuine governed terminal states; iteration caps never enter."""
+    from hermes_cli.resumable_execution import VALID_TERMINAL_STATES, validate_checkpoint
+    payload = dict(checkpoint)
+    validate_checkpoint(payload)
+    terminal = payload.get("terminal_state")
+    if terminal not in VALID_TERMINAL_STATES or terminal == "FAILED_RECOVERABLE":
+        raise ValueError("checkpoint is not a non-recoverable terminal state")
+    if payload.get("task_id") != task_id or (
+        payload.get("provenance") or {}
+    ).get("source_run_id") != expected_run_id:
+        raise ValueError("terminal checkpoint identity does not match active run")
+    signed_receipt = None
+    if terminal == "COMPLETED_CLEAN":
+        signed_receipt = _verify_trusted_closer_authority(
+            conn, payload, closer_task_id=task_id,
+        )
+        if not payload.get("work_complete"):
+            raise ValueError("COMPLETED_CLEAN requires work_complete")
+    elif terminal == "KILLED_BY_EVIDENCE":
+        # B-007: a governed evidence kill is a first-class terminal state with
+        # its own independently signed authority path — the closer presents a
+        # signed FAIL verdict bound to an auditor checkpoint whose status is
+        # KILLED_BY_EVIDENCE. It can never be work_complete.
+        if payload.get("work_complete"):
+            raise ValueError("KILLED_BY_EVIDENCE cannot be work_complete")
+        if payload.get("execution_role") != "closer":
+            raise ValueError("KILLED_BY_EVIDENCE terminal requires an authorized closer")
+        signed_receipt = _verify_trusted_closer_authority(
+            conn, payload, closer_task_id=task_id,
+        )
+    # Persist terminal intent while active-run ownership is still held. If the
+    # process dies before the following transition, recovery sees a running
+    # task with a durable terminal checkpoint instead of a falsely unlabelled
+    # done/blocked task.
+    with write_txn(conn):
+        if signed_receipt is not None:
+            existing_id = conn.execute(
+                "SELECT * FROM audit_authority_receipts WHERE verdict_id=?",
+                (signed_receipt["verdict_id"],),
+            ).fetchone()
+            existing_sha = conn.execute(
+                "SELECT * FROM audit_authority_receipts WHERE verdict_sha256=?",
+                (signed_receipt["verdict_sha256"],),
+            ).fetchone()
+            for existing in (existing_id, existing_sha):
+                if existing is not None and (
+                    existing["verdict_id"] != signed_receipt["verdict_id"]
+                    or existing["verdict_sha256"] != signed_receipt["verdict_sha256"]
+                    or existing["authority_task_id"] != task_id
+                    or existing["accepted_run_id"] != expected_run_id
+                    or existing["candidate_tree"] != signed_receipt.get(
+                        "candidate_tree", (payload.get("bindings") or {}).get("candidate_tree")
+                    )
+                    or existing["consumed_at"] is not None
+                ):
+                    raise ValueError("signed audit verdict replay conflicts with prior authority")
+            conn.execute(
+                "INSERT OR IGNORE INTO audit_authority_receipts "
+                "(verdict_id, verdict_sha256, authority_task_id, audit_task_id, "
+                " candidate_tree, accepted_run_id, signer_key_id, accepted_at, consumed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    signed_receipt["verdict_id"], signed_receipt["verdict_sha256"],
+                    task_id, signed_receipt.get("audit_task_id", "test-audit"),
+                    signed_receipt.get(
+                        "candidate_tree", (payload.get("bindings") or {}).get("candidate_tree")
+                    ),
+                    expected_run_id,
+                    signed_receipt.get("signer_key_id", "test-signer"), int(time.time()),
+                ),
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET terminal_state=?, work_item_kind='fresh' "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (terminal, task_id, expected_run_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("terminal transition lost active-run ownership")
+        _append_event(
+            conn, task_id, "terminal_state_intent", {"terminal_state": terminal},
+            run_id=expected_run_id,
+        )
+    if terminal == "COMPLETED_CLEAN":
+        ok = complete_task(
+            conn, task_id, result=result or "COMPLETED_CLEAN",
+            summary=result, metadata={"terminal_state": terminal},
+            expected_run_id=expected_run_id,
+        )
+    elif terminal == "KILLED_BY_EVIDENCE":
+        ok = complete_task(
+            conn, task_id, result=result or "KILLED_BY_EVIDENCE",
+            summary=result, metadata={"terminal_state": terminal},
+            expected_run_id=expected_run_id,
+        )
+    else:
+        kind = "needs_input" if terminal == "BLOCKED_OPERATOR_EXCEPTION" else "capability"
+        ok = block_task(
+            conn, task_id, reason=result or terminal, kind=kind,
+            expected_run_id=expected_run_id,
+        )
+    if not ok:
+        raise ValueError("terminal transition lost active-run ownership")
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "terminal_state", {"terminal_state": terminal},
+            run_id=expected_run_id,
+        )
+    return str(terminal)
+
+
+def yield_task_for_continuation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    checkpoint: Mapping[str, Any],
+    expected_run_id: int,
+    reason: str = "ITERATION_CAP_REACHED",
+) -> ContinuationCheckpoint:
+    """Atomically persist a checkpoint, close this run, and requeue the task.
+
+    The immutable payload hash makes replay idempotent.  A task status update
+    and checkpoint insert share one SQLite transaction, eliminating the crash
+    window in which either a checkpoint or its eligible queue item could exist
+    alone. Iteration yields never increment the technical-failure breaker.
+    """
+    from hermes_cli.resumable_execution import (
+        assert_continuation_needed, canonical_json_bytes, checkpoint_sha256,
+    )
+
+    payload = dict(checkpoint)
+    if payload.get("task_id") != task_id:
+        raise ValueError("checkpoint task_id does not match task")
+    provenance = payload.get("provenance") or {}
+    if provenance.get("source_run_id") != expected_run_id:
+        raise ValueError("checkpoint source_run_id does not match active run")
+    assert_continuation_needed(payload)
+    payload_text = canonical_json_bytes(payload).decode("utf-8")
+    digest = checkpoint_sha256(payload)
+    now = int(time.time())
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM continuation_checkpoints "
+            "WHERE task_id=? AND source_run_id=? AND checkpoint_sha256=?",
+            (task_id, expected_run_id, digest),
+        ).fetchone()
+        if existing is not None:
+            return ContinuationCheckpoint.from_row(existing)
+        task = conn.execute(
+            "SELECT status, current_run_id, continuation_count FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        if task["status"] != "running" or task["current_run_id"] != expected_run_id:
+            raise ValueError("continuation yield lost active-run ownership")
+        pending = conn.execute(
+            "SELECT id FROM continuation_checkpoints "
+            "WHERE task_id=? AND disposition='pending'", (task_id,),
+        ).fetchone()
+        if pending is not None:
+            raise ValueError("task already has an active continuation")
+        number = int(task["continuation_count"] or 0) + 1
+        cur = conn.execute(
+            "INSERT INTO continuation_checkpoints "
+            "(task_id, source_run_id, continuation_number, reason, "
+            " checkpoint_sha256, payload, created_at, disposition) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+            (task_id, expected_run_id, number, reason, digest, payload_text, now),
+        )
+        checkpoint_id = int(cur.lastrowid)
+        updated = conn.execute(
+            "UPDATE tasks SET status='ready', work_item_kind='continuation', "
+            "continuation_count=?, latest_checkpoint_id=?, current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_heartbeat_at=NULL WHERE id=? AND status='running' "
+            "AND current_run_id=?",
+            (number, checkpoint_id, task_id, expected_run_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("continuation yield lost task CAS")
+        conn.execute(
+            "UPDATE task_runs SET status='yielded', outcome='iteration_yield', "
+            "ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "summary=?, metadata=? WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (
+                now,
+                f"Yielded at phase {payload.get('current_phase')}",
+                json.dumps({"checkpoint_id": checkpoint_id, "checkpoint_sha256": digest}, sort_keys=True),
+                expected_run_id, task_id,
+            ),
+        )
+        _append_event(
+            conn, task_id, "continuation_enqueued",
+            {
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_sha256": digest,
+                "continuation_number": number,
+                "reason": reason,
+                "previous_phase": payload.get("current_phase"),
+                "completed_steps": payload.get("completed_steps", []),
+                "remaining_steps": payload.get("remaining_steps", []),
+            },
+            run_id=expected_run_id,
+        )
+        row = conn.execute(
+            "SELECT * FROM continuation_checkpoints WHERE id=?", (checkpoint_id,),
+        ).fetchone()
+    return ContinuationCheckpoint.from_row(row)
+
+
+# ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
@@ -4329,6 +5277,25 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        pending_checkpoint = conn.execute(
+            "SELECT id, continuation_number FROM continuation_checkpoints "
+            "WHERE task_id=? AND disposition='pending'", (task_id,),
+        ).fetchone()
+        if pending_checkpoint is not None:
+            conn.execute(
+                "UPDATE continuation_checkpoints SET disposition='resumed', "
+                "resumed_run_id=? WHERE id=? AND disposition='pending'",
+                (run_id, int(pending_checkpoint["id"])),
+            )
+            _append_event(
+                conn, task_id, "continuation_resumed",
+                {
+                    "checkpoint_id": int(pending_checkpoint["id"]),
+                    "continuation_number": int(pending_checkpoint["continuation_number"]),
+                    "resumed_run_id": run_id,
+                },
+                run_id=run_id,
+            )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
@@ -4572,6 +5539,13 @@ def release_stale_claims(
                 error=f"stale_lock={row['claim_lock']}",
                 metadata=termination,
             )
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE continuation_checkpoints "
+                    "SET disposition='pending', resumed_run_id=NULL "
+                    "WHERE task_id=? AND resumed_run_id=? AND disposition='resumed'",
+                    (row["id"], run_id),
+                )
             payload = {
                 "stale_lock": row["claim_lock"],
                 "worker_pid": (
@@ -4647,6 +5621,13 @@ def reclaim_task(
             ),
             metadata=termination,
         )
+        if run_id is not None:
+            conn.execute(
+                "UPDATE continuation_checkpoints "
+                "SET disposition='pending', resumed_run_id=NULL "
+                "WHERE task_id=? AND resumed_run_id=? AND disposition='resumed'",
+                (task_id, run_id),
+            )
         payload = {
             "manual": True,
             "reason": reason,
@@ -4869,11 +5850,54 @@ def complete_task(
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
-    and never blocks.
+    advisory and never blocks.
     """
     now = int(time.time())
 
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
+    governance = conn.execute(
+        "SELECT t.requires_independent_audit, t.terminal_state, t.current_run_id, "
+        "       (SELECT r.verdict_id FROM audit_authority_receipts r "
+        "        WHERE r.authority_task_id=t.id "
+        "          AND r.accepted_run_id=t.current_run_id "
+        "          AND r.consumed_at IS NULL LIMIT 1) AS authority_verdict_id "
+        "FROM tasks t WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    classification = (
+        governance["requires_independent_audit"] if governance is not None else 0
+    )
+    authority_verdict_id = (
+        governance["authority_verdict_id"] if governance is not None else None
+    )
+    terminal_authority = (
+        governance is not None
+        and expected_run_id is not None
+        and governance["current_run_id"] == expected_run_id
+        and authority_verdict_id is not None
+        and governance["terminal_state"] in {"COMPLETED_CLEAN", "KILLED_BY_EVIDENCE"}
+    )
+    if classification is None or (bool(classification) and not terminal_authority):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_rejected_governance",
+                {"reason": (
+                    "governance classification is UNKNOWN"
+                    if classification is None
+                    else "trusted independent audit and exact-tree closer required"
+                )},
+                run_id=expected_run_id,
+            )
+        if classification is None:
+            raise ValueError(
+                "governance classification is UNKNOWN; explicitly classify the task "
+                "before completion"
+            )
+        raise ValueError(
+            "completion requires apply_terminal_checkpoint with trusted CLEAN "
+            "independent-audit authority"
+        )
+
+    # Gate: verify created_cards
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
     # surfacing HallucinatedCardsError to the worker; this function
@@ -4941,6 +5965,17 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if bool(classification):
+            if expected_run_id is None or authority_verdict_id is None:
+                raise ValueError("signed terminal authority is not bound to the active run")
+            consumed = conn.execute(
+                "UPDATE audit_authority_receipts SET consumed_at=? "
+                "WHERE verdict_id=? AND authority_task_id=? "
+                "AND accepted_run_id=? AND consumed_at IS NULL",
+                (now, authority_verdict_id, task_id, int(expected_run_id)),
+            )
+            if consumed.rowcount != 1:
+                raise ValueError("signed terminal authority was already consumed or lost")
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -6335,6 +7370,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM continuation_checkpoints WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -6358,6 +7394,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM continuation_checkpoints WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
@@ -7647,6 +8684,67 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+
+    # Restart/interruption recovery: a rich phase heartbeat is already a safe
+    # handoff. Promote it to an eligible continuation before generic crash
+    # accounting, so replay does not consume the failure breaker or discard
+    # exact progress. ``yield_task_for_continuation`` is one atomic transaction;
+    # its task CAS suppresses races with another dispatcher.
+    recovery_rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock, started_at, current_run_id FROM tasks "
+        "WHERE status='running' AND worker_pid IS NOT NULL AND current_run_id IS NOT NULL"
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for recovery in recovery_rows:
+        lock = recovery["claim_lock"] or ""
+        if not lock.startswith(host_prefix) or _pid_alive(recovery["worker_pid"]):
+            continue
+        started_at = recovery["started_at"]
+        if started_at is not None and time.time() - started_at < _resolve_crash_grace_seconds():
+            continue
+        saved = get_saved_phase_checkpoint(
+            conn, recovery["id"], int(recovery["current_run_id"]),
+        )
+        if saved is None:
+            continue
+        if saved.get("work_complete"):
+            terminal = saved.get("terminal_state")
+            if terminal and terminal != "FAILED_RECOVERABLE":
+                try:
+                    apply_terminal_checkpoint(
+                        conn, recovery["id"], checkpoint=saved,
+                        expected_run_id=int(recovery["current_run_id"]),
+                        result="recovered terminal checkpoint after worker interruption",
+                    )
+                    continue
+                except (ValueError, sqlite3.Error):
+                    _log.warning(
+                        "failed to apply terminal checkpoint after interruption for %s",
+                        recovery["id"], exc_info=True,
+                    )
+            # Apparent completion without an applied trusted terminal transition
+            # is not permission to declare success. Requeue a conservative
+            # reconciliation phase instead of discarding the durable state.
+            saved = dict(saved)
+            saved["work_complete"] = False
+            saved["phase_status"] = "RECONCILE_AFTER_INTERRUPTED_FINALIZATION"
+            saved["terminal_state"] = None
+            saved["remaining_steps"] = [
+                "Re-verify apparent completion and apply the authorized terminal transition"
+            ]
+            saved["continuation_instruction"] = saved["remaining_steps"][0]
+        try:
+            yield_task_for_continuation(
+                conn, recovery["id"], checkpoint=saved,
+                expected_run_id=int(recovery["current_run_id"]),
+                reason="WORKER_INTERRUPTED",
+            )
+        except (ValueError, sqlite3.Error):
+            _log.warning(
+                "failed to promote saved checkpoint after worker interruption for %s",
+                recovery["id"], exc_info=True,
+            )
+
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8060,7 +9158,14 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -8068,17 +9173,48 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     the drawer.
     """
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        prior = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid "
+            "FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if prior is None:
+            raise RuntimeError("worker PID registration lost active-run ownership")
+        run_id = expected_run_id if expected_run_id is not None else prior["current_run_id"]
+        claim_lock = (
+            expected_claim_lock
+            if expected_claim_lock is not None
+            else prior["claim_lock"]
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        if (
+            prior["status"] != "running"
+            or run_id is None
+            or not claim_lock
+            or prior["current_run_id"] != run_id
+            or prior["claim_lock"] != claim_lock
+        ):
+            raise RuntimeError("worker PID registration lost active-run ownership")
+        if prior["worker_pid"] not in (None, int(pid)):
+            raise RuntimeError("active run is already bound to a different worker PID")
+        updated = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ? "
+            "AND (worker_pid IS NULL OR worker_pid = ?)",
+            (int(pid), task_id, run_id, claim_lock, int(pid)),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("worker PID registration lost active-run ownership")
+        run_updated = conn.execute(
+            "UPDATE task_runs SET worker_pid = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL "
+            "AND status = 'running' AND claim_lock = ? "
+            "AND (worker_pid IS NULL OR worker_pid = ?)",
+            (int(pid), run_id, task_id, claim_lock, int(pid)),
+        )
+        if run_updated.rowcount != 1:
+            raise RuntimeError("worker PID registration lost active-run ownership")
+        if prior is None or prior["worker_pid"] != int(pid):
+            _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8463,7 +9599,9 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY CASE work_item_kind WHEN 'continuation' THEN 0 "
+        "WHEN 'remediation' THEN 1 WHEN 'audit' THEN 2 ELSE 3 END, "
+        "priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
@@ -9064,6 +10202,63 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _resolve_effective_model_effort(task: Task) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the model + reasoning effort a continuation worker will actually run at.
+
+    Prefers the task's explicit overrides; falls back to the assignee profile's
+    configured default model / reasoning effort. Returns ``(None, None-ish)``
+    components the caller treats as fail-closed when unresolved — a continuation
+    must never launch without a provenance binding (revision-4 finding B-006).
+    """
+    model = (
+        task.model_override.strip()
+        if isinstance(task.model_override, str) and task.model_override.strip()
+        else None
+    )
+    effort = (
+        task.reasoning_effort.strip()
+        if isinstance(task.reasoning_effort, str) and task.reasoning_effort.strip()
+        else None
+    )
+    if model and effort:
+        return model, effort
+    profile_model: Optional[str] = None
+    profile_effort: Optional[str] = None
+    try:
+        from hermes_cli.profiles import _read_config_model, resolve_profile_env
+        profile_dir = Path(resolve_profile_env(task.assignee))
+        profile_model, _ = _read_config_model(profile_dir)
+        config_path = profile_dir / "config.yaml"
+        if config_path.exists():
+            from hermes_cli.config import read_user_config_raw
+            cfg = read_user_config_raw(config_path) or {}
+            model_cfg = cfg.get("model")
+            if isinstance(model_cfg, dict):
+                profile_effort = (
+                    model_cfg.get("reasoning_effort")
+                    or model_cfg.get("reasoning")
+                    or (cfg.get("reasoning_effort") if isinstance(cfg, dict) else None)
+                )
+            elif isinstance(cfg, dict):
+                profile_effort = cfg.get("reasoning_effort") or cfg.get("reasoning")
+    except Exception:
+        # Fail closed: an unresolved profile yields None, which the caller
+        # rejects rather than launching on an unverifiable binding.
+        pass
+    return (
+        model or (
+            profile_model.strip()
+            if isinstance(profile_model, str) and profile_model.strip()
+            else None
+        ),
+        effort or (
+            profile_effort.strip()
+            if isinstance(profile_effort, str) and profile_effort.strip()
+            else None
+        ),
+    )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -9091,6 +10286,8 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
+    effective_workspace = workspace
+    continuation_state: Optional[Mapping[str, Any]] = None
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -9147,6 +10344,25 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    audit_policy = _INDEPENDENT_AUDIT_REVIEWERS.get(task.assignee)
+    if audit_policy is not None:
+        audit_provider, audit_model, audit_effort = audit_policy
+        if (
+            task.provider_override != audit_provider
+            or task.model_override != audit_model
+            or (audit_effort is not None and task.reasoning_effort != audit_effort)
+        ):
+            raise RuntimeError(
+                "independent auditor launch does not match approved reviewer policy"
+            )
+        env["HERMES_EXECUTION_ROLE"] = "auditor"
+        env["HERMES_WORKER_IDENTITY"] = task.assignee
+    elif task.assignee == "authorized-exact-tree-closer":
+        env["HERMES_EXECUTION_ROLE"] = "closer"
+        env["HERMES_WORKER_IDENTITY"] = "authorized-exact-tree-closer"
+    else:
+        env["HERMES_EXECUTION_ROLE"] = "implementer"
+        env["HERMES_WORKER_IDENTITY"] = str(task.assignee or "kanban-worker")
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -9187,6 +10403,145 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    if task.work_item_kind == "continuation" and task.latest_checkpoint_id is not None:
+        # Restore authority and verify exact state before launching any model.
+        # A mismatch aborts spawn; the worker never gets a chance to operate on
+        # bytes different from the durable checkpoint target.
+        _cp_conn = connect(board=board)
+        try:
+            _checkpoint = get_latest_continuation_checkpoint(_cp_conn, task.id)
+        finally:
+            _cp_conn.close()
+        if _checkpoint is None or _checkpoint.id != task.latest_checkpoint_id:
+            raise RuntimeError("continuation checkpoint pointer is missing or stale")
+        from hermes_cli.resumable_execution import (
+            StateDivergenceError, checkpoint_sha256, restore_repository_state,
+            validate_checkpoint, verify_repository_state,
+        )
+        # B-005: the dispatched payload must hash to its immutable checkpoint
+        # column before it is trusted to drive restoration, role selection, or
+        # continuation state. A payload mutated in the DB (bypassing
+        # yield_task_for_continuation) is rejected here, fail-closed, before any
+        # model launches.
+        _recomputed_sha = checkpoint_sha256(_checkpoint.payload)
+        if _recomputed_sha != _checkpoint.checkpoint_sha256:
+            raise RuntimeError(
+                "continuation checkpoint payload hash does not match its immutable "
+                f"digest ({_recomputed_sha} != {_checkpoint.checkpoint_sha256}); "
+                "refusing to launch on tampered state"
+            )
+        validate_checkpoint(_checkpoint.payload)
+        expected_state = _checkpoint.payload.get("current_candidate_state") or {}
+        continuation_state = expected_state
+        if expected_state.get("capture_error"):
+            raise RuntimeError(
+                "continuation cannot verify checkpoint repository state: "
+                + str(expected_state.get("capture_error"))
+            )
+        try:
+            verify_repository_state(workspace, expected_state)
+        except StateDivergenceError:
+            # A checkpoint is a restorable machine state, not merely a drift
+            # detector. Restoration is bounded to the captured inclusion set;
+            # unbound post-checkpoint data still fails closed.
+            restore_repository_state(workspace, expected_state)
+        role = str(_checkpoint.payload["execution_role"])
+        worker_binding = _checkpoint.payload["worker"]
+        # B-006: identity, model, and reasoning effort are enforced fail-closed
+        # on EVERY continuation — including when the task carries no explicit
+        # override and the worker would run the profile default. Checking only
+        # non-null overrides let profile-default drift (checkpoint says model X,
+        # profile now defaults to Y) silently contradict the checkpoint at an
+        # authority transition, and let a checkpoint self-declare a role/identity
+        # the task was never bound to.
+        if not task.assignee:
+            raise RuntimeError("continuation task has no bound assignee identity")
+        if worker_binding.get("identity") != task.assignee:
+            raise RuntimeError(
+                "continuation worker identity no longer matches the bound task assignee"
+            )
+        _effective_model, _effective_effort = _resolve_effective_model_effort(task)
+        if _effective_model is None:
+            raise RuntimeError(
+                "continuation effective model is unresolved; refusing to launch"
+            )
+        if any(ch.isspace() or ord(ch) < 32 for ch in _effective_model):
+            raise RuntimeError(
+                "continuation effective model is malformed; refusing to launch"
+            )
+        if _effective_effort is None:
+            raise RuntimeError(
+                "continuation reasoning effort is unresolved; refusing to launch"
+            )
+        try:
+            _normalized_effective_effort = normalize_reasoning_effort(
+                _effective_effort
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "continuation reasoning effort is malformed; refusing to launch"
+            ) from exc
+        if _normalized_effective_effort != _effective_effort:
+            raise RuntimeError(
+                "continuation reasoning effort is malformed; refusing to launch"
+            )
+        if worker_binding.get("model") != _effective_model:
+            raise RuntimeError(
+                "continuation effective model does not match checkpoint binding: "
+                f"effective model {_effective_model!r} != "
+                f"checkpoint {worker_binding.get('model')!r}"
+            )
+        if worker_binding.get("reasoning_effort") != _effective_effort:
+            raise RuntimeError(
+                "continuation reasoning effort does not match checkpoint binding: "
+                f"effective effort {_effective_effort!r} != "
+                f"checkpoint {worker_binding.get('reasoning_effort')!r}"
+            )
+        if role == "closer" and task.assignee != "authorized-exact-tree-closer":
+            raise RuntimeError("closer continuation requires authorized exact-tree closer")
+        if role == "auditor":
+            audit_policy = _INDEPENDENT_AUDIT_REVIEWERS.get(task.assignee)
+            if audit_policy is None:
+                raise RuntimeError(
+                    "auditor continuation requires an approved reviewer identity"
+                )
+            audit_provider, audit_model, audit_effort = audit_policy
+            if (
+                task.provider_override != audit_provider
+                or task.model_override != audit_model
+                or (audit_effort is not None and task.reasoning_effort != audit_effort)
+            ):
+                raise RuntimeError(
+                    "auditor continuation does not match approved reviewer policy"
+                )
+        env["HERMES_EXECUTION_ROLE"] = role
+        env["HERMES_WORKER_IDENTITY"] = str(worker_binding["identity"])
+        env["HERMES_CONTINUATION_CHECKPOINT_ID"] = str(_checkpoint.id)
+        env["HERMES_CONTINUATION_CHECKPOINT_SHA256"] = _checkpoint.checkpoint_sha256
+
+    if env.get("HERMES_EXECUTION_ROLE") == "auditor":
+        from hermes_cli.resumable_execution import (
+            capture_repository_state, materialize_repository_snapshot,
+        )
+
+        if task.work_item_kind == "continuation" and task.latest_checkpoint_id is not None:
+            if continuation_state is None:
+                raise RuntimeError("auditor continuation has no repository-state binding")
+            audit_state = continuation_state
+        else:
+            audit_state = capture_repository_state(workspace)
+        audit_root = workspaces_root(board=board).parent / "audit-snapshots"
+        snapshot_name = (
+            f"{task.id}-{task.current_run_id or 0}-"
+            f"{audit_state['repository_snapshot_sha256'][:16]}"
+        )
+        effective_workspace = str(
+            materialize_repository_snapshot(audit_state, audit_root / snapshot_name)
+        )
+        env["HERMES_KANBAN_WORKSPACE"] = effective_workspace
+        env["HERMES_AUDIT_WORKSPACE"] = effective_workspace
+        env["TERMINAL_CWD"] = effective_workspace
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -9252,25 +10607,69 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Every production model process gets an inherited one-way capability.
+    # The child blocks on an anonymous pipe whose write end exists only in the
+    # dispatcher. Unlike a predictable pathname, another same-user process
+    # cannot release the payload by creating a file during the PID-CAS window.
+    gate_read_fd, gate_write_fd = os.pipe()
+    os.set_inheritable(gate_read_fd, True)
+    os.set_inheritable(gate_write_fd, False)
+    gate_code = (
+        "import os,sys; fd=int(sys.argv[1]); token=os.read(fd,3); os.close(fd); "
+        "\nif token != b'go\\n': raise SystemExit(75)"
+        "\nos.execvpe(sys.argv[2], sys.argv[2:], os.environ)"
+    )
+    popen_cmd = [sys.executable, "-c", gate_code, str(gate_read_fd), *cmd]
+    gate_popen_kwargs = (
+        {"close_fds": False} if _IS_WINDOWS else {"pass_fds": (gate_read_fd,)}
+    )
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            popen_cmd,
+            cwd=effective_workspace if os.path.isdir(effective_workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **gate_popen_kwargs,
         )
     except FileNotFoundError:
+        os.close(gate_read_fd)
+        os.close(gate_write_fd)
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    try:
+        gate_conn = connect(board=board)
+        try:
+            _set_worker_pid(
+                gate_conn,
+                task.id,
+                proc.pid,
+                expected_run_id=task.current_run_id,
+                expected_claim_lock=task.claim_lock,
+            )
+        finally:
+            gate_conn.close()
+        os.write(gate_write_fd, b"go\n")
+    except Exception:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        log_f.close()
+        raise
+    finally:
+        os.close(gate_read_fd)
+        os.close(gate_write_fd)
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
@@ -9391,6 +10790,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    lines.append(
+        "Execution continuity: after each material phase update, call "
+        "kanban_phase_checkpoint with the full machine-readable state. An "
+        "iteration cap is a normal yield; do not block or ask the operator to resume."
+    )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
@@ -9407,6 +10811,22 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    checkpoint = get_latest_continuation_checkpoint(conn, task_id)
+    if checkpoint is not None:
+        lines.append("## REQUIRED durable continuation restoration")
+        lines.append(
+            "This is continuation " + str(checkpoint.continuation_number)
+            + ". Before new work, verify the repository/candidate bindings in "
+            "this checkpoint. Resume the recorded phase and remaining steps; do "
+            "not repeat completed work or external actions. If live state differs, "
+            "reconcile explicitly or fail closed. The JSON below is authoritative "
+            "execution state, not conversational memory."
+        )
+        lines.append("```json")
+        lines.append(json.dumps(checkpoint.payload, ensure_ascii=False, sort_keys=True))
+        lines.append("```")
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

@@ -28,6 +28,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
 
     class _Proc:
         pid = 4321
+        def terminate(self): pass
 
     def _fake_popen(cmd, **kwargs):
         captured["env"] = kwargs["env"]
@@ -36,6 +37,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
     monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
+    monkeypatch.setattr(kb, "_set_worker_pid", lambda *a, **kw: None)
 
     task = kb.Task(
         id="t_b21733fb",
