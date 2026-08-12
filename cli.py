@@ -18182,8 +18182,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 f"({done_so_far}/{ceiling}); refusing another successor"
             )
         logger.info("goal yield: %s", reason_summary)
-        from agent.turn_finalizer import _yield_kanban_task_checkpoint
-        applied = _yield_kanban_task_checkpoint(
+        from agent import turn_finalizer as _tf
+        applied = _tf._yield_kanban_task_checkpoint(
             cli.agent, last_response,
             reason="GOAL_TURN_BUDGET_REACHED", logger=logger,
         )
@@ -18191,6 +18191,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             raise RuntimeError(
                 "goal yield: no active kanban run bound to this worker"
             )
+        # A durable continuation now exists for this run; disarm the B-004
+        # process-exit guard exactly like the iteration-cap yield does, or
+        # interpreter exit re-checkpoints against the closed run and logs a
+        # false CRITICAL on every normal turnover.
+        _tf._NONTERMINAL_EXIT_STATE["agent"] = None
 
     _run_loop(
         task_id=task_id,
@@ -18660,7 +18665,9 @@ def main(
                         # goal_mode card keeps working in THIS session until an
                         # auxiliary judge agrees the card is done, the worker
                         # terminates the task itself, or the turn budget runs
-                        # out (→ sticky block). Gated on the env vars the
+                        # out (→ durable continuation yield so the dispatcher
+                        # relaunches a successor; sticky block only as the
+                        # fail-closed fallback). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
