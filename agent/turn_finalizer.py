@@ -221,9 +221,13 @@ def finalize_turn(
     # otherwise executes extension Python after the model's last tool call.
     _extensions_locked = _execution_role_is_locked()
 
+    _model_call_budget = getattr(
+        agent, "model_call_budget", getattr(agent, "iteration_budget", None)
+    )
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
+        or getattr(_model_call_budget, "model_call_remaining", 0) <= 0
     )
     budget_fallback_eligible = (
         budget_exhausted

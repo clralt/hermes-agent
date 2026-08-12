@@ -2318,9 +2318,22 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
 
+    from agent.iteration_budget import (
+        ModelCallBudgetExhausted,
+        ModelCallBudgetStateInvalid,
+        consume_model_call_budget,
+    )
+
+    def _reserve_summary_call() -> None:
+        if not consume_model_call_budget(agent):
+            raise ModelCallBudgetExhausted(
+                "iteration budget exhausted before summary model call"
+            )
+
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
 
+        _reserve_summary_call()
         return relay_llm.execute_current(
             request,
             callback,
@@ -2452,6 +2465,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
+            _reserve_summary_call()
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
             summary_response = agent._run_codex_stream(codex_kwargs)
@@ -2564,6 +2578,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
+                _reserve_summary_call()
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
                 retry_response = agent._run_codex_stream(codex_kwargs)
@@ -2626,6 +2641,22 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
+    except ModelCallBudgetStateInvalid:
+        logger.info("Skipping iteration summary: model-call budget state invalid")
+        final_response = (
+            "I couldn't continue because the model-call budget state was invalid."
+        )
+    except ModelCallBudgetExhausted:
+        if getattr(agent, "_model_call_budget_state_invalid", False):
+            logger.info("Skipping iteration summary: model-call budget state invalid")
+            final_response = (
+                "I couldn't continue because the model-call budget state was invalid."
+            )
+        else:
+            logger.info("Skipping iteration summary: model-call budget exhausted")
+            final_response = (
+                "I reached the iteration limit before another model call was allowed."
+            )
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"

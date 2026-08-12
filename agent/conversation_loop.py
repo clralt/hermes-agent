@@ -36,6 +36,12 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.iteration_budget import (
+    ModelCallBudgetExhausted,
+    ModelCallBudgetStateInvalid,
+    consume_model_call_budget,
+    model_call_budget_is_valid,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -1631,7 +1637,23 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    _model_call_budget = getattr(
+        agent, "model_call_budget", getattr(agent, "iteration_budget", None)
+    )
+    _budget_state_invalid = not model_call_budget_is_valid(agent)
+    if _budget_state_invalid:
+        final_response = (
+            "I couldn't continue because the model-call budget state was invalid."
+        )
+        failed = True
+        _turn_exit_reason = "budget_state_invalid"
+
+    while (
+        not _budget_state_invalid
+        and api_call_count < agent.max_iterations
+        and agent.iteration_budget.remaining > 0
+        and getattr(_model_call_budget, "model_call_remaining", 0) > 0
+    ):
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1657,17 +1679,11 @@ def run_conversation(
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
 
-        # Grace call: the budget is exhausted but we gave the model one
-        # more chance.  Consume the grace flag so the loop exits after
-        # this iteration regardless of outcome.
-        if agent._budget_grace_call:
-            agent._budget_grace_call = False
-        elif not agent.iteration_budget.consume():
+        if not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
-
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
             try:
@@ -2677,6 +2693,14 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    # Reserve at the actual provider-attempt boundary. The
+                    # retry loop can invoke this callback more than once for a
+                    # single logical iteration; every outbound request must
+                    # consume the hard model-call cap.
+                    if not consume_model_call_budget(agent):
+                        raise ModelCallBudgetExhausted(
+                            "model-call budget exhausted before provider request"
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2739,6 +2763,37 @@ def run_conversation(
                         api_call_count=api_call_count,
                         middleware_trace=list(_llm_middleware_trace),
                     )
+                except ModelCallBudgetStateInvalid:
+                    # No provider request was issued. Surface a deterministic
+                    # local refusal rather than silently treating malformed
+                    # budget state as an open budget.
+                    agent.iteration_budget.refund()
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    final_response = (
+                        "I couldn't continue because the model-call budget "
+                        "state was invalid."
+                    )
+                    failed = True
+                    _turn_exit_reason = "budget_state_invalid"
+                    break
+                except ModelCallBudgetExhausted:
+                    # No provider request was issued. Undo the logical
+                    # iteration reservation and leave through the normal
+                    # finalizer, which will not attempt an over-cap summary.
+                    agent.iteration_budget.refund()
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    if getattr(agent, "_model_call_budget_state_invalid", False):
+                        final_response = (
+                            "I couldn't continue because the model-call budget "
+                            "state was invalid."
+                        )
+                        failed = True
+                        _turn_exit_reason = "budget_state_invalid"
+                    else:
+                        _turn_exit_reason = "budget_exhausted"
+                    break
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -6065,8 +6120,16 @@ def run_conversation(
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
         if response is None:
-            _turn_exit_reason = "all_retries_exhausted_no_response"
-            print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
+            if getattr(agent, "_model_call_budget_state_invalid", False):
+                final_response = (
+                    "I couldn't continue because the model-call budget "
+                    "state was invalid."
+                )
+                failed = True
+                _turn_exit_reason = "budget_state_invalid"
+            else:
+                _turn_exit_reason = "all_retries_exhausted_no_response"
+                print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
             agent._persist_session(messages, conversation_history)
             break
 
