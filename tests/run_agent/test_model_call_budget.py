@@ -193,3 +193,46 @@ def test_case_9_verification_continuation_stops_at_exact_call_cap(tmp_path, monk
     assert agent.model_call_budget.model_calls == 2
     assert agent._handle_max_iterations.call_count == 0
     assert result["completed"] is False
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [
+        SimpleNamespace(model_call_remaining=1),
+        SimpleNamespace(consume_model_call=lambda: True),
+        SimpleNamespace(
+            model_call_remaining=1,
+            consume_model_call=lambda: (_ for _ in ()).throw(
+                RuntimeError("broken")
+            ),
+        ),
+    ],
+    ids=["missing-consume", "missing-remaining", "consume-raises"],
+)
+def test_case_10_malformed_budget_state_refuses_before_outbound_call(tmp_path, budget):
+    agent = _make_agent(tmp_path, max_iterations=1)
+    calls = []
+    agent._interruptible_api_call = lambda _kwargs: (
+        calls.append(1) or _response("must not run")
+    )
+
+    from agent.conversation_loop import build_turn_context as real_build_turn_context
+
+    def build_with_malformed_budget(*args, **kwargs):
+        context = real_build_turn_context(*args, **kwargs)
+        agent.model_call_budget = budget
+        return context
+
+    with (
+        patch("agent.conversation_loop.build_turn_context", side_effect=build_with_malformed_budget),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("refuse malformed budget")
+
+    assert calls == []
+    assert agent.client.chat.completions.create.call_count == 0
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "budget_state_invalid"
+    assert result["final_response"] == (
+        "I couldn't continue because the model-call budget state was invalid."
+    )

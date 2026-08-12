@@ -18,6 +18,10 @@ class ModelCallBudgetExhausted(RuntimeError):
     """Raised when an outbound model request would exceed the hard cap."""
 
 
+class ModelCallBudgetStateInvalid(ModelCallBudgetExhausted):
+    """Raised when the provider boundary cannot validate the budget state."""
+
+
 class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
@@ -92,14 +96,47 @@ class IterationBudget:
 
 
 def consume_model_call_budget(owner) -> bool:
-    """Consume one outbound call at the provider boundary."""
-    budget = getattr(owner, "model_call_budget", getattr(owner, "iteration_budget", None))
+    """Consume one outbound call at the provider boundary.
+
+    The provider boundary is fail-closed: a missing, incomplete, or broken
+    budget object must never be treated as an unlimited budget.
+    """
+    budget = getattr(owner, "model_call_budget", None)
+    if budget is None:
+        budget = getattr(owner, "iteration_budget", None)
     consume = getattr(budget, "consume_model_call", None)
-    return not callable(consume) or bool(consume())
+    remaining = getattr(budget, "model_call_remaining", None)
+    if not callable(consume) or not isinstance(remaining, int):
+        raise ModelCallBudgetStateInvalid(
+            "model-call budget state is missing or invalid"
+        )
+    try:
+        return bool(consume())
+    except Exception:
+        try:
+            owner._model_call_budget_state_invalid = True
+        except Exception:
+            pass
+        return False
+
+
+def model_call_budget_is_valid(owner) -> bool:
+    """Return whether the owner has the complete boundary budget interface."""
+    try:
+        budget = getattr(owner, "model_call_budget", None)
+        if budget is None:
+            budget = getattr(owner, "iteration_budget", None)
+        return callable(getattr(budget, "consume_model_call", None)) and isinstance(
+            getattr(budget, "model_call_remaining", None), int
+        )
+    except Exception:
+        return False
 
 
 __all__ = [
     "IterationBudget",
     "ModelCallBudgetExhausted",
+    "ModelCallBudgetStateInvalid",
     "consume_model_call_budget",
+    "model_call_budget_is_valid",
 ]

@@ -2320,6 +2320,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     from agent.iteration_budget import (
         ModelCallBudgetExhausted,
+        ModelCallBudgetStateInvalid,
         consume_model_call_budget,
     )
 
@@ -2640,11 +2641,22 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
-    except ModelCallBudgetExhausted:
-        logger.info("Skipping iteration summary: model-call budget exhausted")
+    except ModelCallBudgetStateInvalid:
+        logger.info("Skipping iteration summary: model-call budget state invalid")
         final_response = (
-            "I reached the iteration limit before another model call was allowed."
+            "I couldn't continue because the model-call budget state was invalid."
         )
+    except ModelCallBudgetExhausted:
+        if getattr(agent, "_model_call_budget_state_invalid", False):
+            logger.info("Skipping iteration summary: model-call budget state invalid")
+            final_response = (
+                "I couldn't continue because the model-call budget state was invalid."
+            )
+        else:
+            logger.info("Skipping iteration summary: model-call budget exhausted")
+            final_response = (
+                "I reached the iteration limit before another model call was allowed."
+            )
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"

@@ -227,7 +227,7 @@ def finalize_turn(
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
-        or getattr(_model_call_budget, "model_call_remaining", 1) <= 0
+        or getattr(_model_call_budget, "model_call_remaining", 0) <= 0
     )
     budget_fallback_eligible = (
         budget_exhausted
