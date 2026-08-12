@@ -1992,6 +1992,22 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 )
 
 
+def goal_max_continuations() -> int:
+    """Hard ceiling on dispatcher-relaunched successors for one goal task.
+
+    Bounded-slice turnover must not become an unbounded overnight token
+    burner (2026-08-07 incident: 930M input tokens from self-resetting wake
+    paths). When a task's ``continuation_count`` reaches this ceiling the
+    yield path refuses and the loop falls back to a loud block instead.
+    """
+    raw = os.environ.get("HERMES_GOAL_MAX_CONTINUATIONS", "").strip()
+    try:
+        value = int(raw) if raw else 24
+    except ValueError:
+        return 24
+    return max(1, value)
+
+
 def run_kanban_goal_loop(
     *,
     task_id: str,
@@ -1999,6 +2015,7 @@ def run_kanban_goal_loop(
     run_turn,
     task_status_fn,
     block_fn,
+    yield_fn=None,
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
@@ -2017,8 +2034,14 @@ def run_kanban_goal_loop(
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
        task is still open → one explicit "call kanban_complete" nudge.
     3. When the turn budget is exhausted and the worker still hasn't
-       terminated the task, ``block_fn`` is invoked so the card lands in a
-       sticky ``blocked`` state for human review (NOT a silent exit).
+       terminated the task, the mission hands off instead of dying with it:
+       ``yield_fn(reason, last_response)`` persists a durable continuation
+       checkpoint and atomically requeues the task so the dispatcher launches
+       a successor worker (revision-7 P0-1/P0-2 — a bounded slice ending with
+       the mission open is a normal turnover, not a failure). Only when no
+       ``yield_fn`` was injected, or checkpoint persistence itself raises,
+       does ``block_fn`` fire so the card lands in a sticky loud ``blocked``
+       state for human review (fail closed, NOT a silent exit).
 
     This function performs NO SessionDB persistence — a worker process is
     ephemeral, so the turn budget lives in a local counter. It is fully
@@ -2093,13 +2116,40 @@ def run_kanban_goal_loop(
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 
-        # Budget check BEFORE spending another turn.
+        # Budget check BEFORE spending another turn. A bounded worker slice
+        # that ends with the mission still open is a normal turnover: yield a
+        # durable continuation so the dispatcher launches a successor worker.
+        # Block only as the fail-closed fallback — no yield path injected, or
+        # checkpoint persistence itself failed. Never a silent exit.
         if turns_used >= max_turns:
+            if yield_fn is not None:
+                try:
+                    yield_fn(
+                        f"Goal-mode worker reached its per-worker turn budget "
+                        f"({turns_used}/{max_turns}) with the mission still open. "
+                        f"Last judge verdict: {_truncate(reason, 300)}",
+                        last_response,
+                    )
+                    _log(
+                        f"kanban goal loop: task {task_id} yielded a durable "
+                        f"continuation at {turns_used}/{max_turns} turns"
+                    )
+                    return {
+                        "outcome": "yielded_budget",
+                        "turns_used": turns_used,
+                        "reason": "turn budget reached; durable continuation enqueued",
+                    }
+                except Exception as exc:
+                    _log(
+                        f"kanban goal loop: continuation yield failed ({exc}); "
+                        "falling back to a loud block"
+                    )
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             try:
                 block_fn(
                     f"Goal-mode worker exhausted its turn budget "
-                    f"({turns_used}/{max_turns}) without completing the task. "
+                    f"({turns_used}/{max_turns}) without completing the task "
+                    "and no durable continuation could be enqueued. "
                     f"Last judge verdict: {_truncate(reason, 300)}"
                 )
             except Exception as exc:
@@ -2139,5 +2189,6 @@ __all__ = [
     "clear_goal",
     "migrate_goal_to_session",
     "judge_goal",
+    "goal_max_continuations",
     "run_kanban_goal_loop",
 ]

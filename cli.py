@@ -18156,12 +18156,49 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _yield(reason_summary: str, last_response: str) -> None:
+        # Bounded-slice turnover (revision-7 P0-1/P0-2): persist a durable
+        # checkpoint and atomically requeue this task so the dispatcher
+        # launches a successor worker that resumes the SAME mission from the
+        # checkpoint. Reuses the revision-6 B-004 machinery verbatim. Raises
+        # on any failure so the goal loop falls back to a loud block —
+        # never a silent exit, never an unbounded successor chain.
+        from hermes_cli.goals import goal_max_continuations as _max_cont
+        ceiling = _max_cont()
+        c = _kb.connect()
+        try:
+            t = _kb.get_task(c, task_id)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+        done_so_far = int(getattr(t, "continuation_count", 0) or 0) if t else 0
+        if t is None:
+            raise RuntimeError("goal yield: task vanished")
+        if done_so_far >= ceiling:
+            raise RuntimeError(
+                f"goal yield: continuation ceiling reached "
+                f"({done_so_far}/{ceiling}); refusing another successor"
+            )
+        logger.info("goal yield: %s", reason_summary)
+        from agent.turn_finalizer import _yield_kanban_task_checkpoint
+        applied = _yield_kanban_task_checkpoint(
+            cli.agent, last_response,
+            reason="GOAL_TURN_BUDGET_REACHED", logger=logger,
+        )
+        if not applied:
+            raise RuntimeError(
+                "goal yield: no active kanban run bound to this worker"
+            )
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
+        yield_fn=_yield,
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),

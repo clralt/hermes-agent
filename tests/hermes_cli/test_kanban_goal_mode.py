@@ -128,6 +128,102 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+# ---------------------------------------------------------------------------
+# Revision-7 P0-1/P0-2: budget exhaustion with the mission still open yields
+# a durable continuation (successor turnover) instead of a sticky block.
+# ---------------------------------------------------------------------------
+
+def test_budget_exhaustion_yields_continuation_instead_of_block(monkeypatch):
+    # Mission never satisfies the judge; the per-worker slice runs out.
+    _patch_judge(monkeypatch, ["continue", "continue", "continue"])
+    yields = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="long overnight objective",
+        run_turn=lambda p: "made progress",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("must yield a continuation, not block"),
+        yield_fn=lambda reason, last: yields.append((reason, last)),
+        max_turns=2,
+        first_response="working",
+    )
+    assert res["outcome"] == "yielded_budget"
+    assert len(yields) == 1, "exactly one continuation per turnover"
+    reason, last = yields[0]
+    assert "turn budget" in reason
+    assert last == "made progress", "checkpoint summary must carry the latest response"
+
+
+def test_yield_failure_falls_back_to_loud_block(monkeypatch):
+    # Checkpoint persistence failing must never produce a silent exit.
+    _patch_judge(monkeypatch, ["continue", "continue"])
+    blocks = []
+
+    def _broken_yield(reason, last):
+        raise RuntimeError("checkpoint store unavailable")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="objective",
+        run_turn=lambda p: "x",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocks.append(r),
+        yield_fn=_broken_yield,
+        max_turns=1,
+        first_response="working",
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert len(blocks) == 1
+    assert "no durable continuation could be enqueued" in blocks[0]
+
+
+def test_no_yield_fn_preserves_legacy_block(monkeypatch):
+    # Callers that inject no yield path keep the pre-revision-7 loud block.
+    _patch_judge(monkeypatch, ["continue"])
+    blocks = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="objective",
+        run_turn=lambda p: "x",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocks.append(r),
+        max_turns=1,
+        first_response="working",
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert len(blocks) == 1
+
+
+def test_genuine_completion_never_spawns_successor(monkeypatch):
+    # P0-1 terminal legitimacy: a worker that really finished must terminate,
+    # not turn over.
+    _patch_judge(monkeypatch, ["continue"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="objective",
+        run_turn=lambda p: "x",
+        task_status_fn=lambda: "done",
+        block_fn=lambda r: pytest.fail("no block on genuine completion"),
+        yield_fn=lambda reason, last: pytest.fail("no successor on genuine completion"),
+        max_turns=1,
+        first_response="finished",
+    )
+    assert res["outcome"] == "completed_by_worker"
+
+
+def test_goal_max_continuations_env_override(monkeypatch):
+    monkeypatch.delenv("HERMES_GOAL_MAX_CONTINUATIONS", raising=False)
+    assert goals.goal_max_continuations() == 24
+    monkeypatch.setenv("HERMES_GOAL_MAX_CONTINUATIONS", "6")
+    assert goals.goal_max_continuations() == 6
+    monkeypatch.setenv("HERMES_GOAL_MAX_CONTINUATIONS", "0")
+    assert goals.goal_max_continuations() == 1, "ceiling floors at one successor"
+    monkeypatch.setenv("HERMES_GOAL_MAX_CONTINUATIONS", "junk")
+    assert goals.goal_max_continuations() == 24
+
+
 
 
 

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "revision": "r7-production-continuation",
+  "task_id": "HERMES-RESUMABLE-R7-PRODUCTION-CONTINUATION",
+  "branch": "codex/hermes-resumable-r7-production-continuation",
+  "branch_base": "a42d52323 (r6 + synthetic harness 4de333fc2 + token-cap r2 merge)",
+  "contract": "hermes-audit/2026-08-12_hermes-resumable-r7-production-continuation_handoff_prompt.md",
+  "producer": {
+    "identity": "desktop-fable-5-producer",
+    "model": "claude-fable-5",
+    "reasoning_effort": "high",
+    "note": "operator-directed same-day implementation; independent fresh-context audit still required before merge/deploy"
+  },
+  "defect": "run_kanban_goal_loop blocked the task (sticky human-review state) when a goal-mode worker exhausted its per-worker turn budget with the mission still open. The r6 checkpoint/requeue machinery (B-004) existed one layer below but the goal loop never invoked it, so every overnight mission died at the first worker's turn cap and the operator became the scheduler.",
+  "changes": [
+    {
+      "file": "hermes_cli/goals.py",
+      "summary": "run_kanban_goal_loop gains an injected yield_fn: at turn-budget exhaustion with the mission open it persists a durable continuation (outcome yielded_budget) instead of blocking; block_fn remains the fail-closed fallback when no yield path is injected or checkpoint persistence raises. New goal_max_continuations() reads HERMES_GOAL_MAX_CONTINUATIONS (default 24, floor 1) as the successor-chain ceiling."
+    },
+    {
+      "file": "cli.py",
+      "summary": "_run_kanban_goal_loop_q wires yield_fn to the revision-6 B-004 machinery (agent.turn_finalizer._yield_kanban_task_checkpoint -> kanban_db.yield_task_for_continuation): rich-or-emergency checkpoint, atomic requeue as work_item_kind=continuation, same task id, dispatcher relaunch. Refuses (raising, so the loop blocks loudly) when continuation_count >= goal_max_continuations() -- bounded successor chain, 2026-08-07 token-burn class prevention."
+    },
+    {
+      "file": "tests/hermes_cli/test_kanban_goal_mode.py",
+      "summary": "Five behavioral tests: budget exhaustion yields exactly one continuation carrying the latest response; yield failure falls back to a loud block; legacy no-yield_fn callers keep the block; genuine completion never spawns a successor; continuation-ceiling env parsing with floor."
+    }
+  ],
+  "verification": {
+    "focused": "tests/hermes_cli/test_kanban_goal_mode.py 9 passed; + test_kanban_resumable_execution.py + tests/agent/test_turn_finalizer_iteration_limit_exit.py = 55 passed",
+    "discrimination": "4 of 5 new tests FAIL at branch base a42d52323 (yield_fn parameter and goal_max_continuations absent); all pass with the fix. Legacy-block compat test passes at both, by design.",
+    "lint": "ruff check on all three files: All checks passed!",
+    "compile": "python3 -m py_compile clean; git diff --check clean",
+    "full_suite": "scripts/run_tests.sh run once after implementation; results recorded in the commit conversation record (daily note 2026-08-12)"
+  },
+  "successor_launch_path": "yield_task_for_continuation -> task status=ready, work_item_kind=continuation, latest_checkpoint_id bound -> gateway-embedded dispatcher (60s tick) -> spawn_worker restores repository state from the checkpoint snapshot, binds HERMES_CONTINUATION_CHECKPOINT_ID/SHA256, re-enters goal mode (HERMES_KANBAN_GOAL_MODE=1) -> successor resumes the same mission id from the checkpoint.",
+  "out_of_scope_remaining": [
+    "P1-2 audit-boundary park/resume via B-005 (existing machinery, not wired to the goal loop in this increment)",
+    "Hermes-side BLOCKED alerting beyond the existing sticky block + desktop watcher (desktop half shipped 2026-08-12)",
+    "merge, deploy into the running gateway, and the live unattended-overnight proof (operator-gated)"
+  ],
+  "created_at_utc": "2026-08-12T10:35:00Z"
+}
