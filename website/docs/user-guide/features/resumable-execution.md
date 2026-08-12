@@ -58,6 +58,51 @@ Controllers can label created cards `fresh`, `remediation`, or `audit`; dispatch
 
 A cap is never approval, rejection, completion, or an operator exception.
 
+## Synthetic mission verification
+
+The repository includes a local-only accelerated mission harness at
+`scripts/synthetic_mission.py`. It models the baton architecture with real
+subprocess boundaries:
+
+```text
+supervisor process
+  -> fresh controller process for each bounded slice
+      -> fresh worker process for each bounded unit
+          -> structured result + durable checkpoint
+```
+
+The harness injects worker crashes, controller crashes, and audit failures. It
+persists controller state, pending work, immutable checkpoint files, worker
+results, accepted artifacts, and a content hash of the event log. The supervisor
+owns no progress state; after a process exits it only reads the exit protocol
+and launches a fresh controller against the durable root.
+
+Run the accelerated 6-hour-equivalent mission (32 bounded units, 36 worker
+turnovers, 9 controller lifetimes):
+
+```bash
+python3 scripts/synthetic_mission.py \\
+  --supervise \\
+  --root /tmp/hermes-synthetic-mission \\
+  --steps 32 \\
+  --controller-slice 4 \\
+  --crash-steps 2,7 \\
+  --audit-fail-steps 4,9 \\
+  --controller-crash-step 16 \\
+  --logical-hours 6 \\
+  --json
+```
+
+The expected terminal summary has `status=COMPLETED`, `zero_human_intervention=true`,
+`max_concurrent_workers=1`, at least two worker crashes, at least two audit
+failures, one controller crash, and `logical_duration_seconds >= 21600`.
+Changing `--logical-hours 12` runs the same mission against a 12-hour logical
+clock without keeping any process alive for 12 hours.
+
+The automated test is `tests/test_synthetic_mission.py`; it also exercises a
+controller restart from an interrupted run and verifies that invalid or
+misbound worker results fail closed.
+
 ## Terminal states
 
 Supported governed terminal states are:
